@@ -1,3 +1,4 @@
+
 import tkinter as tk
 from tkinter import filedialog
 import os
@@ -32,7 +33,6 @@ def terminal_print(text="", color=None):
     terminal.insert(tk.END, text + "\n")
 
     if color:
-
         tag_name = f"color_{color.replace('#', '')}"
 
         terminal.tag_config(
@@ -394,66 +394,23 @@ def cmd_info(args):
 # ============================================================
 # COMMANDE TIKTOK
 # ============================================================
-#
-# Utilisation :
-#
-# tik "Nom du profil Chrome"
-#
-# Exemple :
-#
-# tik "TikTok Business"
-#
-# Le nom doit correspondre au nom affiché
-# dans le profil Chrome.
-#
-# ============================================================
+
 
 def cmd_tik(args):
-    """
-    Commande :
-        tik "Nom du profil Chrome"
 
-    Exemple :
-        tik "Personne 1"
-
-    Ouvre TikTok Studio avec le profil Chrome choisi
-    puis clique automatiquement sur "Sélectionner une vidéo".
-    """
-
-    # ============================================================
-    # IMPORTS
-    # ============================================================
-
-    import os
-    import json
-    import subprocess
     import time
     import threading
-
-    # ============================================================
-    # Vérification de l'argument
-    # ============================================================
-
-    if len(args) != 1:
-        terminal_print(
-            'Usage : tik "Nom du profil Chrome"',
-            "#ffaa00"
-        )
-        return
-
-    profile_name = args[0]
-
-    # ============================================================
-    # Fonction réelle exécutée dans un thread
-    # ============================================================
+    import os
+    import json
 
     def tik_worker():
 
-        # --------------------------------------------------------
-        # Selenium
-        # --------------------------------------------------------
+        # ========================================================
+        # SELENIUM
+        # ========================================================
 
         try:
+
             import sys
             import selenium
 
@@ -482,9 +439,9 @@ def cmd_tik(args):
 
             return
 
-        # --------------------------------------------------------
-        # Local State Chrome
-        # --------------------------------------------------------
+        # ========================================================
+        # LOCAL STATE CHROME
+        # ========================================================
 
         local_state_path = os.path.expandvars(
             r"%LOCALAPPDATA%\Google\Chrome\User Data\Local State"
@@ -499,10 +456,6 @@ def cmd_tik(args):
 
             return
 
-        # --------------------------------------------------------
-        # Lecture Local State
-        # --------------------------------------------------------
-
         try:
 
             with open(
@@ -516,15 +469,15 @@ def cmd_tik(args):
         except Exception as e:
 
             terminal_print(
-                f"Erreur lecture Chrome : {e}",
+                f"Erreur lecture Local State : {e}",
                 "#ff5555"
             )
 
             return
 
-        # --------------------------------------------------------
-        # Recherche du profil
-        # --------------------------------------------------------
+        # ========================================================
+        # RECHERCHE DU PROFIL
+        # ========================================================
 
         profile_cache = (
             local_state
@@ -536,24 +489,21 @@ def cmd_tik(args):
 
         for folder_name, profile_data in profile_cache.items():
 
-            chrome_name = profile_data.get(
+            name = profile_data.get(
                 "name",
                 ""
             )
 
-            if chrome_name.lower() == profile_name.lower():
+            if name.lower() == args[0].lower():
 
                 chrome_profile = folder_name
-                break
 
-        # --------------------------------------------------------
-        # Profil introuvable
-        # --------------------------------------------------------
+                break
 
         if chrome_profile is None:
 
             terminal_print(
-                f'Profil "{profile_name}" introuvable.',
+                f'Profil "{args[0]}" introuvable.',
                 "#ff5555"
             )
 
@@ -570,60 +520,28 @@ def cmd_tik(args):
                 )
 
                 terminal_print(
-                    f"  - {name}",
-                    "#ffffff"
+                    f"  - {name} ({folder_name})",
+                    "#888888"
                 )
 
             return
 
-        # --------------------------------------------------------
-        # Recherche de Chrome
-        # --------------------------------------------------------
+        terminal_print(
+            f"Profil trouvé : {chrome_profile}",
+            "#888888"
+        )
 
-        chrome_paths = [
-
-            os.path.expandvars(
-                r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"
-            ),
-
-            os.path.expandvars(
-                r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"
-            ),
-
-            os.path.expandvars(
-                r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-            )
-        ]
-
-        chrome_exe = None
-
-        for path in chrome_paths:
-
-            if os.path.exists(path):
-
-                chrome_exe = path
-                break
-
-        if chrome_exe is None:
-
-            terminal_print(
-                "Chrome.exe introuvable.",
-                "#ff5555"
-            )
-
-            return
-
-        # --------------------------------------------------------
-        # User Data
-        # --------------------------------------------------------
+        # ========================================================
+        # USER DATA
+        # ========================================================
 
         user_data_dir = os.path.expandvars(
             r"%LOCALAPPDATA%\Google\Chrome\User Data"
         )
 
-        # --------------------------------------------------------
-        # URL
-        # --------------------------------------------------------
+        # ========================================================
+        # URL TIKTOK
+        # ========================================================
 
         tiktok_url = (
             "https://www.tiktok.com/"
@@ -631,125 +549,145 @@ def cmd_tik(args):
             "?from=webapp&tab=video"
         )
 
-        # --------------------------------------------------------
-        # Lancement Chrome
-        # --------------------------------------------------------
+        # ========================================================
+        # OPTIONS CHROME
+        # ========================================================
+
+        options = Options()
+
+        options.add_argument(
+            f"--user-data-dir={user_data_dir}"
+        )
+
+        options.add_argument(
+            f"--profile-directory={chrome_profile}"
+        )
+
+        options.add_argument(
+            "--start-maximized"
+        )
+
+        # ========================================================
+        # LANCEMENT CHROME PAR SELENIUM
+        # ========================================================
 
         terminal_print(
-            f'Ouverture du profil "{profile_name}"...',
+            f'Lancement du profil "{args[0]}"...',
             "#00ff88"
         )
 
         try:
-
-            subprocess.Popen([
-                chrome_exe,
-
-                f"--user-data-dir={user_data_dir}",
-
-                f"--profile-directory={chrome_profile}",
-
-                "--remote-debugging-port=9222",
-
-                "--remote-allow-origins=*",
-
-                tiktok_url
-            ])
-
-        except Exception as e:
-
-            terminal_print(
-                f"Erreur lancement Chrome : {e}",
-                "#ff5555"
-            )
-
-            return
-
-        terminal_print(
-            f'Chrome ouvert avec "{profile_name}".',
-            "#00ff88"
-        )
-
-        # --------------------------------------------------------
-        # Attendre Chrome
-        # --------------------------------------------------------
-
-        time.sleep(3)
-
-        # --------------------------------------------------------
-        # Connexion Selenium
-        # --------------------------------------------------------
-
-        try:
-
-            options = Options()
-
-            options.add_experimental_option(
-                "debuggerAddress",
-                "127.0.0.1:9222"
-            )
 
             driver = webdriver.Chrome(
                 options=options
             )
 
-            terminal_print(
-                "Selenium connecté à Chrome.",
-                "#00ff88"
-            )
-
         except Exception as e:
 
             terminal_print(
-                f"Impossible de connecter Selenium : {e}",
+                "Impossible de lancer Chrome avec ce profil.",
                 "#ff5555"
             )
 
-            return
-
-        # --------------------------------------------------------
-        # Ouvrir TikTok Studio
-        # --------------------------------------------------------
-
-        try:
-
-            driver.get(tiktok_url)
-
             terminal_print(
-                "TikTok Studio ouvert.",
-                "#00ff88"
-            )
-
-        except Exception as e:
-
-            terminal_print(
-                f"Erreur TikTok Studio : {e}",
+                str(e),
                 "#ff5555"
             )
 
-            return
+            terminal_print(
+                "",
+                "#ffffff"
+            )
 
-        # --------------------------------------------------------
-        # Attendre que la page soit chargée
-        # --------------------------------------------------------
+            terminal_print(
+                "IMPORTANT : ferme complètement Chrome",
+                "#ffaa00"
+            )
+
+            terminal_print(
+                "avant de lancer la commande tik.",
+                "#ffaa00"
+            )
+
+            return
 
         terminal_print(
-            "Recherche du bouton « Sélectionner une vidéo »...",
+            "Chrome lancé avec le vrai profil.",
+            "#00ff88"
+        )
+
+        # ========================================================
+        # OUVERTURE TIKTOK STUDIO
+        # ========================================================
+
+        terminal_print(
+            "Ouverture de TikTok Studio...",
             "#888888"
         )
 
         try:
 
-            wait = WebDriverWait(
-                driver,
-                30
+            driver.get(
+                tiktok_url
             )
 
-            # ====================================================
-            # MÉTHODE 1
-            # ====================================================
+        except Exception as e:
 
-            bouton = wait.until(
+            terminal_print(
+                f"Erreur ouverture TikTok : {e}",
+                "#ff5555"
+            )
+
+            return
+
+        # ========================================================
+        # ATTENTE PAGE
+        # ========================================================
+
+        try:
+
+            WebDriverWait(
+                driver,
+                60
+            ).until(
+                lambda d:
+                d.execute_script(
+                    "return document.readyState"
+                ) == "complete"
+            )
+
+        except:
+
+            pass
+
+        terminal_print(
+            "Attente du chargement de TikTok...",
+            "#888888"
+        )
+
+        time.sleep(5)
+
+        # ========================================================
+        # RECHERCHE DU BOUTON
+        # ========================================================
+
+        terminal_print(
+            "Recherche de « Sélectionner une vidéo »...",
+            "#888888"
+        )
+
+        bouton = None
+
+        # --------------------------------------------------------
+        # MÉTHODE 1
+        # --------------------------------------------------------
+
+        try:
+
+            bouton = WebDriverWait(
+                driver,
+                30
+            ).until(
                 EC.presence_of_element_located(
                     (
                         By.CSS_SELECTOR,
@@ -759,116 +697,236 @@ def cmd_tik(args):
             )
 
             terminal_print(
-                "Bouton trouvé.",
+                "Bouton trouvé !",
                 "#00ff88"
             )
 
-            # ----------------------------------------------------
-            # Faire défiler jusqu'au bouton
-            # ----------------------------------------------------
+        except:
 
-            driver.execute_script(
-                """
-                arguments[0].scrollIntoView({
-                    behavior: 'instant',
-                    block: 'center'
-                });
-                """,
-                bouton
-            )
+            pass
 
-            time.sleep(0.5)
+        # --------------------------------------------------------
+        # MÉTHODE 2
+        # --------------------------------------------------------
 
-            # ====================================================
-            # MÉTHODE 2 : clic Selenium
-            # ====================================================
+        if bouton is None:
 
             try:
 
-                bouton.click()
+                bouton = WebDriverWait(
+                    driver,
+                    15
+                ).until(
+                    EC.presence_of_element_located(
+                        (
+                            By.CSS_SELECTOR,
+                            ".upload-stage-btn"
+                        )
+                    )
+                )
 
                 terminal_print(
-                    "Bouton cliqué avec Selenium.",
+                    "Bouton trouvé avec .upload-stage-btn !",
                     "#00ff88"
                 )
 
-            except Exception as click_error:
+            except:
+
+                pass
+
+        # --------------------------------------------------------
+        # MÉTHODE 3 : TEXTE
+        # --------------------------------------------------------
+
+        if bouton is None:
+
+            try:
+
+                elements = driver.find_elements(
+                    By.XPATH,
+                    "//*[contains("
+                    "translate("
+                    "normalize-space(.),"
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ',"
+                    "'abcdefghijklmnopqrstuvwxyzàâäéèêëîïôöùûüç'"
+                    "),"
+                    "'sélectionner une vidéo'"
+                    ")]"
+                )
+
+                for element in elements:
+
+                    try:
+
+                        if element.is_displayed():
+
+                            bouton = element
+
+                            terminal_print(
+                                "Bouton trouvé par son texte !",
+                                "#00ff88"
+                            )
+
+                            break
+
+                    except:
+
+                        pass
+
+            except Exception as e:
 
                 terminal_print(
-                    "Clic Selenium refusé, tentative JavaScript...",
-                    "#ffaa00"
+                    f"Recherche texte échouée : {e}",
+                    "#888888"
                 )
 
-                # =================================================
-                # MÉTHODE 3 : JavaScript
-                # =================================================
+        # ========================================================
+        # BOUTON INTROUVABLE
+        # ========================================================
 
-                driver.execute_script(
-                    """
-                    arguments[0].click();
-                    """,
-                    bouton
-                )
-
-                terminal_print(
-                    "Bouton cliqué avec JavaScript.",
-                    "#00ff88"
-                )
-
-        except Exception as e:
+        if bouton is None:
 
             terminal_print(
-                "Bouton introuvable après 30 secondes.",
+                "Bouton introuvable.",
                 "#ff5555"
             )
 
             terminal_print(
-                str(e),
-                "#ff5555"
+                "Voici les boutons détectés :",
+                "#ffaa00"
             )
-
-            # ----------------------------------------------------
-            # Debug : afficher les boutons trouvés
-            # ----------------------------------------------------
 
             try:
 
-                boutons = driver.find_elements(
+                buttons = driver.find_elements(
                     By.TAG_NAME,
                     "button"
                 )
 
-                terminal_print(
-                    f"{len(boutons)} boutons trouvés sur la page.",
-                    "#888888"
-                )
-
-                for i, b in enumerate(boutons[:20]):
+                for i, button in enumerate(buttons):
 
                     try:
 
-                        texte = b.text.strip()
+                        texte = button.text.strip()
 
-                        classe = b.get_attribute(
+                        classe = button.get_attribute(
                             "class"
                         )
 
                         if texte:
 
                             terminal_print(
-                                f"[{i}] {texte} | {classe}",
+                                f"[{i}] {texte}",
                                 "#888888"
                             )
 
+                            terminal_print(
+                                f"    {classe}",
+                                "#555555"
+                            )
+
                     except:
+
                         pass
 
             except:
+
                 pass
 
+            return
+
+        # ========================================================
+        # SCROLL
+        # ========================================================
+
+        try:
+
+            driver.execute_script(
+                """
+                arguments[0].scrollIntoView({
+                    behavior: 'instant',
+                    block: 'center',
+                    inline: 'center'
+                });
+                """,
+                bouton
+            )
+
+            time.sleep(1)
+
+        except:
+
+            pass
+
+        # ========================================================
+        # CLIC 1 : SELENIUM
+        # ========================================================
+
+        try:
+
+            bouton.click()
+
+            terminal_print(
+                "✓ Bouton cliqué !",
+                "#00ff88"
+            )
+
+            return
+
+        except Exception as e:
+
+            terminal_print(
+                f"Clic Selenium échoué : {e}",
+                "#ffaa00"
+            )
+
+        # ========================================================
+        # CLIC 2 : JAVASCRIPT
+        # ========================================================
+
+        try:
+
+            driver.execute_script(
+                """
+                arguments[0].scrollIntoView({
+                    block: 'center',
+                    inline: 'center'
+                });
+
+                arguments[0].click();
+                """,
+                bouton
+            )
+
+            terminal_print(
+                "✓ Bouton cliqué avec JavaScript !",
+                "#00ff88"
+            )
+
+            return
+
+        except Exception as e:
+
+            terminal_print(
+                f"Clic JavaScript échoué : {e}",
+                "#ff5555"
+            )
+
     # ============================================================
-    # IMPORTANT :
-    # Tkinter reste maintenant disponible pendant Selenium
+    # VÉRIFICATION ARGUMENT
+    # ============================================================
+
+    if len(args) != 1:
+
+        terminal_print(
+            'Usage : tik "Nom du profil Chrome"',
+            "#ffaa00"
+        )
+
+        return
+
+    # ============================================================
+    # THREAD
     # ============================================================
 
     thread = threading.Thread(
@@ -877,46 +935,6 @@ def cmd_tik(args):
     )
 
     thread.start()
-# ============================================================
-# AJOUTER TES PROPRES COMMANDES
-# ============================================================
-#
-# Pour créer une nouvelle commande :
-#
-# def cmd_ma_commande(args):
-#
-#     terminal_print(
-#         "Ma commande fonctionne !",
-#         "#00ff88"
-#     )
-#
-#
-# Puis ajoute-la dans COMMANDS :
-#
-# "ma": cmd_ma_commande,
-#
-#
-# Si ta commande possède des arguments :
-#
-# def cmd_say(args):
-#
-#     if not args:
-#         terminal_print("Usage : say <texte>")
-#         return
-#
-#     terminal_print(" ".join(args))
-#
-#
-# Puis :
-#
-# "say": cmd_say,
-#
-#
-# Grâce à shlex, les guillemets fonctionnent :
-#
-# say "Bonjour tout le monde"
-#
-# ============================================================
 
 
 # ============================================================
@@ -925,7 +943,6 @@ def cmd_tik(args):
 
 COMMANDS = {
 
-    # Commandes fichiers
     "ls": cmd_ls,
     "pwd": cmd_pwd,
     "cd": cmd_cd,
@@ -934,19 +951,16 @@ COMMANDS = {
     "rm": cmd_rm,
     "cat": cmd_cat,
 
-    # Commandes terminal
     "clear": cmd_clear,
     "cls": cmd_cls,
     "echo": cmd_echo,
-    "help": None,
 
-    # Commandes personnalisées
     "hello": cmd_hello,
     "about": cmd_about,
     "info": cmd_info,
 
-    # TikTok
     "tik": cmd_tik,
+
 }
 
 
@@ -957,10 +971,12 @@ COMMANDS = {
 def cmd_help(args):
 
     terminal_print("")
+
     terminal_print(
         "===== COMMANDES DISPONIBLES =====",
         "#00ff88"
     )
+
     terminal_print("")
 
     for command in COMMANDS:
@@ -970,6 +986,7 @@ def cmd_help(args):
         )
 
     terminal_print("")
+
     terminal_print(
         "exit / quit  -> fermer le terminal",
         "#ffaa00"
@@ -993,7 +1010,6 @@ def execute_command(event=None):
 
         return
 
-    # Affichage de la commande
     terminal_print(
         f"{os.getcwd()} > {command_line}",
         PROMPT_COLOR
@@ -1003,10 +1019,6 @@ def execute_command(event=None):
         0,
         tk.END
     )
-
-    # --------------------------------------------------------
-    # PARSING AVEC GUILLEMETS
-    # --------------------------------------------------------
 
     try:
 
@@ -1031,10 +1043,6 @@ def execute_command(event=None):
 
     args = parts[1:]
 
-    # --------------------------------------------------------
-    # QUITTER
-    # --------------------------------------------------------
-
     if command.lower() in (
         "exit",
         "quit"
@@ -1043,10 +1051,6 @@ def execute_command(event=None):
         root.destroy()
 
         return
-
-    # --------------------------------------------------------
-    # COMMANDES
-    # --------------------------------------------------------
 
     if command.lower() in COMMANDS:
 
@@ -1327,7 +1331,6 @@ command_entry.pack(
 )
 
 
-# Entrée pour exécuter
 command_entry.bind(
     "<Return>",
     execute_command
@@ -1371,7 +1374,7 @@ terminal_print("")
 
 
 # ============================================================
-# FOCUS SUR LE CHAMP
+# FOCUS
 # ============================================================
 
 command_entry.focus_set()
