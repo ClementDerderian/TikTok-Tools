@@ -1,0 +1,1 @@
+gen_video Clement "D:\Tiktok\images\personnage.png" "Le personnage prend un hamburger et dit : C'est trop bon wesh !"

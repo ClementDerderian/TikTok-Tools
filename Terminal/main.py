@@ -9,6 +9,15 @@ import subprocess
 import shlex
 from pathlib import Path
 
+import time
+import threading
+
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 # ============================================================
 # CONFIGURATION
@@ -1598,6 +1607,289 @@ def cmd_delflow(args):
 
 
 
+def cmd_gen_video(args):
+    if len(args) != 3:
+        terminal_print(
+            'Usage : gen_video <profil> "<image>" "<prompt>"',
+            "#ff5555"
+        )
+        return
+
+    profile_name = args[0]
+    image_path = Path(args[1].strip('"'))
+    prompt = args[2]
+
+    if not image_path.is_file():
+        terminal_print(f"Image introuvable : {image_path}", "#ff5555")
+        return
+
+    def worker():
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.common.exceptions import TimeoutException
+        import time
+
+        def log(message, color="#ffffff"):
+            root.after(0, lambda: terminal_print(message, color))
+
+        try:
+            project_url = (
+                "https://flow.google.com/project/"
+                "ce29a6b2-be48-4d19-9652-085de12eaa35"
+            )
+
+            log(f"Vérification du profil : {profile_name}", "#55aaff")
+
+            # Même fonctionnement que gen_image
+            cmd_cresce([profile_name])
+
+            log("Chrome lancé. Vérification du port...", "#55aaff")
+
+            options = webdriver.ChromeOptions()
+            options.add_experimental_option(
+                "debuggerAddress",
+                "127.0.0.1:9222"
+            )
+
+            driver = None
+
+            for attempt in range(15):
+                try:
+                    driver = webdriver.Chrome(options=options)
+                    break
+                except Exception:
+                    time.sleep(1)
+
+            if driver is None:
+                raise Exception("Impossible de se connecter à Chrome.")
+
+            wait = WebDriverWait(driver, 30)
+
+            log("Connexion Chrome OK.", "#55ff55")
+            log(driver.capabilities.get("browserVersion", "Version inconnue"))
+
+            # Recherche de l'onglet Google Flow
+            flow_tab = None
+
+            for handle in driver.window_handles:
+                driver.switch_to.window(handle)
+
+                if "flow.google.com" in driver.current_url:
+                    flow_tab = handle
+                    break
+
+            if flow_tab is None:
+                driver.get(project_url)
+            else:
+                driver.switch_to.window(flow_tab)
+
+                if project_url not in driver.current_url:
+                    driver.get(project_url)
+
+            wait.until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    '[role="textbox"][aria-label^="Que voulez-vous créer"]'
+                ))
+            )
+
+            log("Google Flow détecté.", "#55ff55")
+
+            # Configuration du mode vidéo
+            log("Configuration du mode vidéo...", "#55aaff")
+
+            settings_button = wait.until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    'button[aria-label="Déclencheur des paramètres"]'
+                ))
+            )
+
+            settings_button.click()
+            time.sleep(1)
+
+            def select_toggle(label):
+                toggle = wait.until(
+                    EC.presence_of_element_located((
+                        By.XPATH,
+                        f'//mat-button-toggle[.//span[normalize-space()="{label}"]]'
+                    ))
+                )
+
+                if "mat-button-toggle-checked" not in toggle.get_attribute("class"):
+                    driver.execute_script(
+                        "arguments[0].click();",
+                        toggle
+                    )
+
+                time.sleep(0.5)
+
+            select_toggle("Vidéo")
+            log("Mode vidéo sélectionné.", "#55ff55")
+
+            select_toggle("Ingrédients")
+            log("Mode ingrédients sélectionné.", "#55ff55")
+
+            select_toggle("9:16")
+            log("Format vertical sélectionné.", "#55ff55")
+
+            select_toggle("x1")
+            log("Une vidéo sélectionnée.", "#55ff55")
+
+            # Vérification du modèle
+            model_element = wait.until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    ".model-select-trigger-content"
+                ))
+            )
+
+            model_name = model_element.text
+
+            log(f"Modèle actuel : {model_name}", "#55aaff")
+
+            if "Veo 3.1" not in model_name:
+                raise Exception(
+                    "Le modèle sélectionné n'est pas Veo 3.1."
+                )
+
+            # Fermeture des paramètres
+            settings_button.click()
+            time.sleep(1)
+
+            # Ouverture du panneau des ingrédients
+            add_ingredients = wait.until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    'button[aria-label="Ajouter des ingrédients au champ du prompt"]'
+                ))
+            )
+
+            add_ingredients.click()
+            time.sleep(1)
+
+            # Interception de l'ouverture du sélecteur de fichiers
+            driver.execute_script("""
+                window.__flowFileInput = null;
+
+                const originalClick = HTMLInputElement.prototype.click;
+
+                HTMLInputElement.prototype.click = function() {
+                    if (this.type === 'file') {
+                        window.__flowFileInput = this;
+                        return;
+                    }
+
+                    return originalClick.call(this);
+                };
+            """)
+
+            # Clic sur le bouton d'importation
+            upload_button = wait.until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    "button.sidebar-upload-btn"
+                ))
+            )
+
+            upload_button.click()
+
+            # Récupération du champ fichier
+            file_input = wait.until(
+                lambda d: d.execute_script(
+                    "return window.__flowFileInput;"
+                )
+            )
+
+            file_input.send_keys(str(image_path.resolve()))
+
+            log("Image envoyée à Google Flow.", "#55aaff")
+
+            time.sleep(5)
+
+            # Ajouter l'image au prompt
+            log("Ajout de l'image au prompt...", "#55aaff")
+
+            add_to_prompt = wait.until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    "button.detail-add-to-prompt-btn"
+                ))
+            )
+
+            driver.execute_script(
+                "arguments[0].click();",
+                add_to_prompt
+            )
+
+            log("Image ajoutée au prompt.", "#55ff55")
+
+            # Attendre la fermeture du panneau latéral
+            wait.until(
+                EC.invisibility_of_element_located((
+                    By.CSS_SELECTOR,
+                    ".cdk-overlay-backdrop"
+                ))
+            )
+
+            time.sleep(1)
+
+            # Récupération de la zone de prompt
+            prompt_box = wait.until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    '[role="textbox"][aria-label^="Que voulez-vous créer"]'
+                ))
+            )
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});",
+                prompt_box
+            )
+
+            driver.execute_script(
+                "arguments[0].focus();",
+                prompt_box
+            )
+
+            prompt_box.send_keys(prompt)
+
+            log("Prompt inséré.", "#55ff55")
+
+            time.sleep(1)
+
+            # Lancement de la génération
+            generate_button = wait.until(
+                EC.element_to_be_clickable((
+                    By.CSS_SELECTOR,
+                    'button[aria-label="Lancer la génération"]'
+                ))
+            )
+
+            log("Lancement de Veo 3.1...", "#55aaff")
+
+            generate_button.click()
+
+            log(
+                "Génération lancée ! Format vertical 9:16.",
+                "#55ff55"
+            )
+
+        except Exception as e:
+            log(
+                f"Erreur gen_video : {type(e).__name__}: {e}",
+                "#ff5555"
+            )
+
+        finally:
+            log("Commande gen_video terminée.", "#aaaaaa")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+
 # ============================================================
 # TABLE DES COMMANDES
 # ============================================================
@@ -1627,6 +1919,7 @@ COMMANDS = {
     "gen_image": cmd_gen_image,
     "save_img": cmd_save_img,
     "delflow": cmd_delflow,
+    "gen_video": cmd_gen_video
 
 }
 
@@ -1663,6 +1956,8 @@ def cmd_help(args):
 
 
 COMMANDS["help"] = cmd_help
+
+
 
 
 # ============================================================
