@@ -1,0 +1,9 @@
+#J'initialise un tableau de profil
+
+profil = |"Clem","2"|
+ref = profil[0]
+
+# On creer toutes les images du fichier prompt
+
+gen_image ref image.txt
+
