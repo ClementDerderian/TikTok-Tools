@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog
 import os
+import io
 import re
 import shutil
 import platform
@@ -8,6 +9,9 @@ import json
 import subprocess
 import shlex
 import socket
+import sys
+import queue
+import collections
 import time
 import threading
 import base64 as _b64
@@ -40,17 +44,34 @@ FONT = ("Consolas", 11)
 # AFFICHAGE DANS LE TERMINAL
 # ============================================================
 
+# Chaque onglet fait tourner ses commandes dans un processus « worker » : ici
+# terminal_print n'écrit pas dans un widget, il envoie l'affichage à l'onglet.
+# (Dans la fenêtre principale, _manager_sink affiche dans l'onglet actif.)
+
+WORKER_MODE = "--worker" in sys.argv[1:]
+_proto_out = None          # worker : flux réservé au protocole (voir worker_main)
+_proto_lock = threading.Lock()
+_manager_sink = None
+
+
+def _emit(event):
+    if _proto_out is None:
+        return
+    with _proto_lock:
+        try:
+            _proto_out.write(json.dumps(event, ensure_ascii=False) + "\n")
+            _proto_out.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def terminal_print(text="", color=None):
-    terminal.insert(tk.END, text + "\n")
-
-    if color:
-        tag_name = f"color_{color.replace('#', '')}"
-        terminal.tag_config(tag_name, foreground=color)
-        start = terminal.index("end-2l")
-        end = terminal.index("end-1l")
-        terminal.tag_add(tag_name, start, end)
-
-    terminal.see(tk.END)
+    if WORKER_MODE:
+        _emit({"e": "print", "text": text, "color": color})
+    elif _manager_sink is not None:
+        _manager_sink(text, color)
+    else:
+        print(text)
 
 
 # ============================================================
@@ -159,7 +180,7 @@ def cmd_cat(args):
 
 
 def cmd_clear(args):
-    terminal.delete("1.0", tk.END)
+    _emit({"e": "clear"})
 
 
 def cmd_echo(args):
@@ -212,7 +233,9 @@ def cmd_fivi(args):
         terminal_print(f"Le fichier n'a que {len(lines)} ligne(s).", "#ffaa00")
         return
 
-    terminal_print(lines[n - 1].replace("{", "").replace("}", "").strip())
+    text = lines[n - 1].replace("{", "").replace("}", "").strip()
+    terminal_print(text)
+    return text  # permet : b = fivi video.txt 1
 
 
 def cmd_hello(args):
@@ -988,6 +1011,11 @@ def cmd_gen_image(args):
                 if index < len(prompts):
                     log("Attente de 60 secondes avant le prochain prompt...", "#ffaa00")
                     time.sleep(60)
+                else:
+                    # Dernier prompt : on laisse Flow finir de générer, sinon la
+                    # commande suivante d'un script CD (save...) partirait trop tôt.
+                    log("Attente de 60 secondes : fin de la génération...", "#ffaa00")
+                    time.sleep(60)
 
             log("Tous les prompts ont été traités !", "#55ff55")
 
@@ -1051,14 +1079,17 @@ def ensure_flow_project_tab(driver, profile, say):
 #   save "C:\Mes\Medias"         -> si le 1er argument n'est pas un profil connu,
 #                                   il est pris comme dossier
 #
-# Corrections :
-#   - le vrai conteneur de défilement est .page-container
-#     ([cdkvirtualscrollingelement]) et non cdk-virtual-scroll-viewport
-#   - les tuiles vidéo n'ont pas de <video> dans le DOM tant qu'on ne les
-#     survole / ouvre pas : on déclenche le survol puis l'ouverture
-#   - tout est repéré par la structure de la page (indépendant de la langue)
-#   - le port Chrome est relu après le lancement (plus de décalage de port)
-#   - les fichiers déjà présents sont ignorés
+# Nommage :
+#   - images converties en JPG : scene_1_A.jpg, scene_1_B.jpg, scene_1_C.jpg,
+#     scene_2_A.jpg, ...  (3 images par scène, comme gen_image)
+#   - vidéos : video_scene_1.mp4, video_scene_2.mp4, ...
+#   - un fichier _index.json dans le dossier retient quel média a quel nom :
+#     relancer save ne renomme rien et continue la numérotation.
+#   - nécessite Pillow pour la conversion JPG : pip install pillow
+
+# Mets False si la galerie Flow affiche les plus anciens médias en premier.
+GALLERY_NEWEST_FIRST = True
+IMAGES_PER_SCENE = 3
 
 # Fonction JS réutilisable : trouve l'élément qui défile réellement
 _FLOW_SCROLLER_JS = """
@@ -1151,16 +1182,36 @@ def _flow_ext(data, content_type, media_type):
 
 
 def _flow_media_name(item):
-    """Nom de fichier stable (sans extension) pour une image ou une vidéo.
+    """Identifiant stable (sans extension) pour une image ou une vidéo.
 
-    Pour les vidéos on se base sur la miniature (stable) plutôt que sur l'URL
-    de la vidéo, qui peut être signée et changer d'une session à l'autre.
+    Sert de clé dans _index.json. Pour les vidéos on se base sur la miniature
+    (stable) plutôt que sur l'URL de la vidéo, qui peut être signée et changer
+    d'une session à l'autre.
     """
     if item["id"]:
         return item["id"]
     base = item.get("thumb") or item.get("title") or item["url"]
     digest = _hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
     return f"video_{digest}"
+
+
+def _to_jpg_bytes(data):
+    """Convertit n'importe quelle image (WEBP, PNG...) en JPG. None si impossible."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        if img.mode in ("RGBA", "LA", "P"):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=95)
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def _flow_resolve_video_url(driver, key):
@@ -1344,15 +1395,36 @@ def cmd_save(args):
             log("Parcours de la galerie Flow (images + vidéos)...", "#ffaa00")
             items = _flow_collect_all(driver, log)
 
-            n_img = sum(1 for i in items if i["type"] == "image")
-            n_vid = sum(1 for i in items if i["type"] == "video")
-            log(f"{len(items)} média(s) trouvé(s) : {n_img} image(s), "
-                f"{n_vid} vidéo(s).", "#55ff55")
+            images = [i for i in items if i["type"] == "image"]
+            videos = [i for i in items if i["type"] == "video"]
+            log(f"{len(items)} média(s) trouvé(s) : {len(images)} image(s), "
+                f"{len(videos)} vidéo(s).", "#55ff55")
 
             if not items:
                 log("Rien à sauvegarder.", "#ffaa00")
                 _flow_dump(driver, "save_empty", log)
                 return
+
+            # Ordre chronologique : le plus ancien (scène 1) en premier
+            if GALLERY_NEWEST_FIRST:
+                images.reverse()
+                videos.reverse()
+            ordered = images + videos
+
+            # ---- Index des médias déjà sauvegardés ----
+            index_path = folder / "_index.json"
+            try:
+                manifest = json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            # on oublie les entrées dont le fichier a été supprimé
+            manifest = {k: v for k, v in manifest.items()
+                        if (folder / v["file"]).exists()}
+
+            count = {
+                "image": sum(1 for v in manifest.values() if v["type"] == "image"),
+                "video": sum(1 for v in manifest.values() if v["type"] == "video"),
+            }
 
             # Session requests de secours (cookies + User-Agent du navigateur)
             fallback = None
@@ -1375,14 +1447,236 @@ def cmd_save(args):
 
             saved = skipped = failed = 0
 
-            for n, item in enumerate(items, 1):
-                name = _flow_media_name(item)
-                label = "vidéo" if item["type"] == "video" else "image"
+            for n, item in enumerate(ordered, 1):
+                key = _flow_media_name(item)
+                kind = item["type"]
+                label = "vidéo" if kind == "video" else "image"
 
-                # Déjà sauvegardé ? (quelle que soit l'extension)
-                if any(folder.glob(name + ".*")):
+                if key in manifest:
                     skipped += 1
-                    log(f"[{n}/{len(items)}] {label} déjà présente : {name}", "#888888")
+                    log(f"[{n}/{len(ordered)}] {label} déjà présente : "
+                        f"{manifest[key]['file']}", "#888888")
+                    continue
+
+                # Nom visé selon la position
+                pos = count[kind]
+                if kind == "image":
+                    scene = pos // IMAGES_PER_SCENE + 1
+                    letter = chr(ord("A") + pos % IMAGES_PER_SCENE)
+                    base = f"scene_{scene}_{letter}"
+                else:
+                    base = f"video_scene_{pos + 1}"
+
+                data = None
+                content_type = ""
+                last_err = None
+
+                # 1) téléchargement depuis la page
+                try:
+                    res = driver.execute_async_script(_FLOW_FETCH_JS, item["url"])
+                    if res and res.get("ok") and res.get("data"):
+                        data = _b64.b64decode(res["data"])
+                        content_type = res.get("ct", "")
+                    else:
+                        last_err = (res or {}).get("err", "réponse vide")
+                except Exception as exc:
+                    last_err = exc
+
+                # 2) secours : requests
+                if not data:
+                    try:
+                        resp = get_fallback().get(item["url"], timeout=120)
+                        resp.raise_for_status()
+                        data = resp.content
+                        content_type = resp.headers.get("Content-Type", "")
+                    except Exception as exc:
+                        last_err = f"{last_err} | requests : {exc}"
+
+                if not data:
+                    failed += 1
+                    log(f"[{n}/{len(ordered)}] Échec {label} {base} : {last_err}", "#ff5555")
+                    continue
+
+                if kind == "image":
+                    jpg = _to_jpg_bytes(data)
+                    if jpg is not None:
+                        data, ext = jpg, ".jpg"
+                    else:
+                        ext = _flow_ext(data, content_type, kind)
+                        log("Conversion JPG impossible (pip install pillow ?) : "
+                            f"fichier gardé en {ext}", "#ffaa00")
+                else:
+                    ext = _flow_ext(data, content_type, kind)
+
+                path = folder / (base + ext)
+                path.write_bytes(data)
+                manifest[key] = {"file": path.name, "type": kind}
+                count[kind] += 1
+                index_path.write_text(
+                    json.dumps(manifest, indent=2, ensure_ascii=False),
+                    encoding="utf-8"
+                )
+                saved += 1
+                log(f"[{n}/{len(ordered)}] {label} sauvegardée : "
+                    f"{path.name} ({len(data) / 1024:,.0f} Ko)", "#55ff55")
+
+            log("", None)
+            log("==============================", "#00ff88")
+            log("SAUVEGARDE TERMINÉE", "#00ff88")
+            log(f"Nouveaux fichiers : {saved}", "#55ff55")
+            log(f"Déjà présents     : {skipped}", "#aaaaaa")
+            log(f"Échecs            : {failed}", "#ff5555" if failed else "#aaaaaa")
+            log(f"Dossier : {folder.resolve()}", "#55aaff")
+            log("==============================", "#00ff88")
+
+        except Exception as exc:
+            log(f"Erreur save : {type(exc).__name__}: {exc}", "#ff5555")
+
+        # Selenium est attaché à une session Chrome existante : on ne la ferme pas.
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ============================================================
+# save_video : sauvegarde UNIQUEMENT les vidéos de Flow
+# ============================================================
+# Utilisation :
+#   save_video                  -> profil par défaut, dossier "video"
+#   save_video profil           -> ce profil Chrome, dossier "video"
+#   save_video profil dossier   -> ce profil, un autre dossier
+#
+# Les fichiers sont numérotés dans l'ordre chronologique : 1.mp4, 2.mp4, 3.mp4...
+# Si le dossier contient déjà 1.mp4 et 2.mp4, la prochaine vidéo sera 3.mp4.
+
+VIDEO_FOLDER = "video"
+
+
+def _flow_next_video_number(folder):
+    """Plus grand numéro déjà utilisé dans le dossier, + 1 (1 si le dossier est vide)."""
+    used = [int(p.stem) for p in folder.iterdir()
+            if p.is_file() and p.stem.isdigit()]
+    return max(used, default=0) + 1
+
+
+def cmd_save_video(args):
+    args = [a.strip().strip('"') for a in args]
+    sessions = load_chrome_sessions()
+
+    profile_arg = None
+    folder_arg = None
+
+    if len(args) >= 2:
+        profile_arg, folder_arg = args[0], args[1]
+    elif len(args) == 1:
+        if args[0] in sessions:
+            profile_arg = args[0]
+        else:
+            folder_arg = args[0]
+
+    folder = Path(folder_arg) if folder_arg else Path(VIDEO_FOLDER)
+
+    def log(message, color=None):
+        try:
+            root.after(0, lambda m=message, c=color: terminal_print(m, c))
+        except Exception:
+            print(message)
+
+    def worker():
+        try:
+            selected_profile = profile_arg or get_default_chrome_profile()
+            log(f"Profil : {selected_profile}", "#55aaff")
+
+            driver = connect_selenium(
+                selected_profile,
+                get_flow_project_url(selected_profile) or "about:blank",
+                log
+            )
+            if driver is None:
+                return
+            driver.set_script_timeout(180)
+
+            if not ensure_flow_project_tab(driver, selected_profile, log):
+                return
+
+            folder.mkdir(parents=True, exist_ok=True)
+
+            log("Parcours de la galerie Flow (vidéos uniquement)...", "#ffaa00")
+            items = _flow_collect_all(driver, log)
+            videos = [i for i in items if i["type"] == "video"]
+            log(f"{len(videos)} vidéo(s) trouvée(s).", "#55ff55")
+
+            if not videos:
+                log("Aucune vidéo à sauvegarder.", "#ffaa00")
+                _flow_dump(driver, "save_video_empty", log)
+                return
+
+            # Ordre chronologique : la plus ancienne = 1
+            if GALLERY_NEWEST_FIRST:
+                videos.reverse()
+
+            # Une même vidéo peut être relevée deux fois (clé de miniature qui
+            # change pendant le défilement) : on retire les URL identiques,
+            # en ignorant les paramètres de signature (?...).
+            seen_urls = set()
+            unique = []
+            for v in videos:
+                base_url = v["url"].split("?", 1)[0]
+                if base_url in seen_urls:
+                    continue
+                seen_urls.add(base_url)
+                unique.append(v)
+            if len(unique) < len(videos):
+                log(f"{len(videos) - len(unique)} doublon(s) d'URL ignoré(s).", "#888888")
+            videos = unique
+
+            # ---- Index des vidéos déjà sauvegardées ----
+            index_path = folder / "_index.json"
+            try:
+                manifest = json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            manifest = {k: v for k, v in manifest.items()
+                        if (folder / v["file"]).exists()}
+
+            fallback = None
+
+            def get_fallback():
+                nonlocal fallback
+                if fallback is None:
+                    import requests
+                    fallback = requests.Session()
+                    for ck in driver.get_cookies():
+                        fallback.cookies.set(
+                            ck["name"], ck["value"],
+                            domain=ck.get("domain"), path=ck.get("path", "/")
+                        )
+                    fallback.headers.update({
+                        "User-Agent": driver.execute_script("return navigator.userAgent"),
+                        "Referer": driver.current_url,
+                    })
+                return fallback
+
+            # Empreinte (SHA-1) du contenu de chaque vidéo déjà dans le dossier :
+            # garantit qu'un même fichier n'est jamais enregistré deux fois.
+            known_hashes = {}
+            for existing in folder.iterdir():
+                if existing.is_file() and existing.stem.isdigit():
+                    try:
+                        digest = _hashlib.sha1(existing.read_bytes()).hexdigest()
+                        known_hashes.setdefault(digest, existing.name)
+                    except OSError:
+                        pass
+
+            saved = skipped = failed = 0
+            next_number = _flow_next_video_number(folder)
+
+            for n, item in enumerate(videos, 1):
+                key = _flow_media_name(item)
+
+                if key in manifest:
+                    skipped += 1
+                    log(f"[{n}/{len(videos)}] vidéo déjà présente : "
+                        f"{manifest[key]['file']}", "#888888")
                     continue
 
                 data = None
@@ -1412,30 +1706,47 @@ def cmd_save(args):
 
                 if not data:
                     failed += 1
-                    log(f"[{n}/{len(items)}] Échec {label} {name} : {last_err}", "#ff5555")
+                    log(f"[{n}/{len(videos)}] Échec vidéo : {last_err}", "#ff5555")
                     continue
 
-                ext = _flow_ext(data, content_type, item["type"])
-                path = folder / (name + ext)
+                digest = _hashlib.sha1(data).hexdigest()
+                if digest in known_hashes:
+                    skipped += 1
+                    # on mémorise la clé pour ne pas la retélécharger la prochaine fois
+                    manifest[key] = {"file": known_hashes[digest], "type": "video"}
+                    index_path.write_text(
+                        json.dumps(manifest, indent=2, ensure_ascii=False),
+                        encoding="utf-8"
+                    )
+                    log(f"[{n}/{len(videos)}] doublon ignoré (identique à "
+                        f"{known_hashes[digest]})", "#888888")
+                    continue
+
+                ext = _flow_ext(data, content_type, "video")
+                path = folder / f"{next_number}{ext}"
+                known_hashes[digest] = path.name
                 path.write_bytes(data)
+                manifest[key] = {"file": path.name, "type": "video"}
+                index_path.write_text(
+                    json.dumps(manifest, indent=2, ensure_ascii=False),
+                    encoding="utf-8"
+                )
+                next_number += 1
                 saved += 1
-                size_kb = len(data) / 1024
-                log(f"[{n}/{len(items)}] {label} sauvegardée : "
-                    f"{path.name} ({size_kb:,.0f} Ko)", "#55ff55")
+                log(f"[{n}/{len(videos)}] vidéo sauvegardée : "
+                    f"{path.name} ({len(data) / 1024:,.0f} Ko)", "#55ff55")
 
             log("", None)
             log("==============================", "#00ff88")
-            log("SAUVEGARDE TERMINÉE", "#00ff88")
-            log(f"Nouveaux fichiers : {saved}", "#55ff55")
-            log(f"Déjà présents     : {skipped}", "#aaaaaa")
-            log(f"Échecs            : {failed}", "#ff5555" if failed else "#aaaaaa")
+            log("SAUVEGARDE VIDÉO TERMINÉE", "#00ff88")
+            log(f"Nouvelles vidéos : {saved}", "#55ff55")
+            log(f"Déjà présentes   : {skipped}", "#aaaaaa")
+            log(f"Échecs           : {failed}", "#ff5555" if failed else "#aaaaaa")
             log(f"Dossier : {folder.resolve()}", "#55aaff")
             log("==============================", "#00ff88")
 
         except Exception as exc:
-            log(f"Erreur save : {type(exc).__name__}: {exc}", "#ff5555")
-
-        # Selenium est attaché à une session Chrome existante : on ne la ferme pas.
+            log(f"Erreur save_video : {type(exc).__name__}: {exc}", "#ff5555")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1684,6 +1995,113 @@ def _flow_find_first(driver, locators, timeout=20, must_be_enabled=False):
     return None
 
 
+# Attente de fin de génération vidéo (en secondes)
+GEN_VIDEO_MIN_WAIT = 60      # jamais conclure « terminé » avant ce délai
+GEN_VIDEO_TIMEOUT = 900      # abandon de l'attente après ce délai
+
+_FLOW_READY_VIDEOS_JS = """
+const ready = [];
+let busyCount = 0, total = 0;
+document.querySelectorAll('flow-grid-tile-container').forEach(c => {
+    const vt = c.querySelector('flow-video-tile');
+    if (!vt) return;
+    total++;
+    // Occupée = vrai spinner de chargement, ou une ligne qui n'est QUE « 45 % ».
+    // (l'ancienne version prenait aussi toute barre de progression et tout
+    // « n % » dans le texte, ce qui bloquait sur des tuiles déjà terminées)
+    const lines = (c.innerText || '').split(/\\n/).map(x => x.trim());
+    const busy = !!c.querySelector('mat-progress-spinner, mat-spinner')
+              || lines.some(x => /^\\d{1,3}\\s*%$/.test(x));
+    if (busy) { busyCount++; return; }
+    const th = vt.querySelector('img.thumbnail');
+    const thumb = th ? (th.currentSrc || th.src || '') : '';
+    if (thumb && !thumb.startsWith('data:')) ready.push(thumb);
+});
+return {ready: ready, busy: busyCount, total: total};
+"""
+
+
+def _flow_video_state(driver):
+    """Etat de la galerie : miniatures prêtes, tuiles occupées, nombre total de vidéos."""
+    try:
+        driver.execute_script(_FLOW_SCROLLER_JS + """
+            const s = scroller(); if (s) s.scrollTop = 0;
+        """)
+        time.sleep(1)
+        st = driver.execute_script(_FLOW_READY_VIDEOS_JS) or {}
+        return {"ready": list(st.get("ready", [])),
+                "busy": int(st.get("busy", 0)),
+                "total": int(st.get("total", 0))}
+    except Exception:
+        return {"ready": [], "busy": 0, "total": 0}
+
+
+def _flow_ready_video_keys(driver):
+    """Miniatures des vidéos prêtes (haut de la galerie, où arrivent les nouvelles)."""
+    return set(_flow_video_state(driver)["ready"])
+
+
+def _flow_wait_new_video(driver, before, log):
+    """Attend qu'une nouvelle vidéo apparaisse dans la galerie, terminée.
+
+    `before` = état de la galerie juste avant le lancement (_flow_video_state).
+    Deux façons de conclure :
+      1) une miniature prête qui n'existait pas avant ;
+      2) secours : plus aucune tuile occupée ET une vidéo de plus qu'avant,
+         stable sur 3 contrôles et après au moins 120 s.
+    """
+    if not isinstance(before, dict):  # ancien format : simple ensemble de miniatures
+        before = {"ready": list(before), "total": 0}
+    before_ready = set(before.get("ready", []))
+    before_total = before.get("total", 0)
+
+    start = time.time()
+    stable = 0
+    stable_fallback = 0
+    dumped = False
+    log("Attente de la fin de la génération vidéo...", "#ffaa00")
+    last_report = 0
+
+    while time.time() - start < GEN_VIDEO_TIMEOUT:
+        time.sleep(5)
+        elapsed = time.time() - start
+        st = _flow_video_state(driver)
+
+        new_ready = set(st["ready"]) - before_ready
+        if new_ready and elapsed >= GEN_VIDEO_MIN_WAIT:
+            stable += 1
+            if stable >= 2:  # présente et inchangée sur 2 contrôles
+                log(f"Vidéo prête ({int(elapsed)} s).", "#55ff55")
+                return True
+        else:
+            stable = 0
+
+        grew = st["total"] > before_total and st["busy"] == 0
+        if grew and elapsed >= 120:
+            stable_fallback += 1
+            if stable_fallback >= 3:
+                log(f"Vidéo prête ({int(elapsed)} s, détection de secours).", "#55ff55")
+                return True
+        else:
+            stable_fallback = 0
+
+        # Une seule fois, on garde la page pour comprendre si ça bloque
+        if not dumped and elapsed >= 180:
+            dumped = True
+            _flow_dump(driver, "video_wait_180s", log)
+
+        if elapsed - last_report >= 30:
+            last_report = elapsed
+            log(f"... génération en cours ({int(elapsed)} s) "
+                f"[prêtes : {len(st['ready'])}, occupées : {st['busy']}, "
+                f"total : {st['total']}]", "#888888")
+
+    log(f"Délai dépassé ({GEN_VIDEO_TIMEOUT} s) : vidéo non détectée, on continue.",
+        "#ffaa00")
+    _flow_dump(driver, "video_wait_timeout", log)
+    return False
+
+
 def cmd_gen_video(args):
 
     if len(args) != 3:
@@ -1914,9 +2332,17 @@ def cmd_gen_video(args):
                 _flow_dump(driver, "video_generate", log)
                 return
 
+            # Vidéos déjà prêtes avant la génération (pour repérer la nouvelle)
+            step = "attente génération"
+            before_keys = _flow_video_state(driver)
+
             log("Lancement de Veo 3.1...", "#55aaff")
             driver.execute_script("arguments[0].click();", generate_button)
             log("Génération lancée ! Format vertical 9:16, 1 vidéo.", "#55ff55")
+
+            # La commande ne se termine qu'une fois la vidéo prête : c'est ce qui
+            # fait attendre la ligne suivante d'un script CD (save, delflow...).
+            _flow_wait_new_video(driver, before_keys, log)
 
         except Exception as e:
             log(
@@ -1933,6 +2359,953 @@ def cmd_gen_video(args):
 
 
 # ============================================================
+# montage : éditeur vidéo graphique (sélection à la souris, coupes franches, avec le son)
+# ============================================================
+# Utilisation :
+#   montage                         -> clips du dossier "video", sortie montage.mp4
+#   montage dossier                 -> clips d'un autre dossier
+#   montage dossier final.mp4       -> nom du fichier final
+#
+# La fenêtre ouvre les vidéos UNE PAR UNE (1.mp4, 2.mp4, ...). Sous l'image, une
+# frise montre toute la vidéo ; la partie gardée est encadrée en vert.
+#
+#   Souris  : clic / glisser sur la frise = se déplacer dans la vidéo
+#             glisser une poignée verte    = déplacer le début ou la fin
+#             Maj + glisser                = sélectionner une zone (en bleu)
+#   Clavier : Espace = lecture/pause (saute les parties supprimées)
+#             ← → = image par image (Maj = 1 s)
+#             I / O = début / fin ici (coupe les blancs avant / après la tête de lecture)
+#             C = couper en deux à la tête de lecture
+#             Suppr = supprimer la zone bleue (ou le morceau cliqué)
+#             R = tout remettre     Entrée = valider et passer à la suivante
+#
+# Après la dernière vidéo, Entrée lance l'assemblage : les morceaux gardés sont collés
+# bout à bout, sans transition, avec leur son, accélérés de MONTAGE_SPEED, avec une
+# musique de fond par-dessus (réglages ci-dessous). Les découpes sont mémorisées dans
+# <dossier>/_montage.json. Nécessite FFmpeg (ffmpeg et ffprobe dans le PATH).
+
+import tempfile
+import ctypes
+
+# ---- Réglages de la vidéo finale (modifiables) ----
+MONTAGE_SPEED = 1.3             # vitesse de toute la vidéo (1.0 = normale, 1.3 = 30 % plus vite)
+MONTAGE_MUSIC = "son.mp3"       # musique de fond ; None = aucune. Cherchée dans le dossier
+                                # courant puis à côté de main.py (ou mets un chemin complet)
+MONTAGE_MUSIC_VOLUME = 0.15     # volume de la musique : 0.15 = 15 % (1.0 = volume d'origine)
+MONTAGE_VOICE_VOLUME = 1.5      # volume du son des vidéos (la voix) : 1.5 = 150 %
+
+# Son synchronisé : sous Windows, le son est joué par MCI (winmm, déjà dans Windows,
+# rien à installer) et c'est LUI qui sert d'horloge à l'image. Image et son ne peuvent
+# donc plus se décaler. Ailleurs : lecture par ffplay, image sur l'horloge système.
+_MCI_OK = platform.system() == "Windows" and hasattr(ctypes, "windll")
+_MCI_ALIAS = "montage_snd"
+MONTAGE_AUDIO_OFFSET = 0.0   # secondes ; si l'image est en retard sur le son, mets une valeur
+                             # négative (ex : -0.08), si elle est en avance, positive.
+
+
+def _mci(command):
+    """Envoie une commande MCI. Renvoie (code d'erreur, texte de réponse)."""
+    buf = ctypes.create_unicode_buffer(256)
+    err = ctypes.windll.winmm.mciSendStringW(command, buf, 255, 0)
+    return err, buf.value
+
+MONTAGE_FPS = 30                   # images/s de la vidéo finale
+MONTAGE_PREVIEW_FPS = 15           # images/s de l'aperçu dans l'éditeur
+MONTAGE_MIN_SEGMENT = 0.1          # durée minimale d'un morceau gardé (s)
+_MONTAGE_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
+
+
+def _no_window():
+    """Évite l'ouverture d'une console noire à chaque appel FFmpeg sous Windows."""
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def _run_capture(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **_no_window())
+
+
+def _probe_clip(path):
+    """Renvoie (durée en secondes, a une piste audio, (largeur, hauteur))."""
+    def probe(*a):
+        return _run_capture(["ffprobe", "-v", "error", *a, str(path)]).stdout.strip()
+
+    duration = float(probe("-show_entries", "format=duration", "-of", "csv=p=0"))
+    has_audio = bool(probe("-select_streams", "a",
+                           "-show_entries", "stream=index", "-of", "csv=p=0"))
+    dims = probe("-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0")
+    width, height = (int(x) for x in dims.split(",")[:2])
+    return duration, has_audio, (width, height)
+
+
+# ---------- découpe en morceaux gardés : [(début, fin), ...] triés ----------
+
+def _seg_split(segments, t):
+    out = []
+    for s, e in segments:
+        if s + MONTAGE_MIN_SEGMENT < t < e - MONTAGE_MIN_SEGMENT:
+            out += [(s, t), (t, e)]
+        else:
+            out.append((s, e))
+    return out
+
+
+def _seg_subtract(segments, a, b):
+    """Retire la zone [a, b] des morceaux gardés."""
+    out = []
+    for s, e in segments:
+        if b <= s or a >= e:
+            out.append((s, e))
+            continue
+        if a - s >= MONTAGE_MIN_SEGMENT:
+            out.append((s, a))
+        if e - b >= MONTAGE_MIN_SEGMENT:
+            out.append((b, e))
+    return out
+
+
+# ---------- assemblage FFmpeg ----------
+
+def _find_music():
+    """Chemin de la musique de fond, ou None si désactivée / introuvable."""
+    if not MONTAGE_MUSIC:
+        return None
+    path = Path(MONTAGE_MUSIC)
+    candidates = [path] if path.is_absolute() else [
+        Path.cwd() / path, Path(__file__).resolve().parent / path]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _atempo_chain(speed):
+    """Filtre FFmpeg de vitesse du son (atempo accepte 0,5 à 2 par étage)."""
+    parts = []
+    while speed > 2.0:
+        parts.append("atempo=2.0")
+        speed /= 2.0
+    while speed < 0.5:
+        parts.append("atempo=0.5")
+        speed /= 0.5
+    parts.append(f"atempo={speed:.4f}")
+    return ",".join(parts)
+
+
+def _montage_command(clips, out_path):
+    """Commande FFmpeg : découpe de chaque morceau, collage bout à bout (coupes franches),
+    accélération de toute la vidéo, puis musique de fond mélangée par-dessus.
+
+    clips : dicts avec path, start, end, has_audio, size
+    """
+    width, height = clips[0]["size"]
+    inputs, parts = [], []
+    music = _find_music()
+
+    for i, c in enumerate(clips):
+        inputs += ["-i", str(c["path"])]
+        s, e = c["start"], c["end"]
+        parts.append(
+            f"[{i}:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+            f"fps={MONTAGE_FPS},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}]"
+        )
+        if c["has_audio"]:
+            parts.append(
+                f"[{i}:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS,"
+                f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]"
+            )
+        else:  # clip sans son : silence de la même durée
+            parts.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=duration={e - s:.3f},"
+                f"asetpts=PTS-STARTPTS[a{i}]"
+            )
+    joined = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
+    parts.append(f"{joined}concat=n={len(clips)}:v=1:a=1[cv][ca]")
+
+    # vitesse de toute la vidéo (image + son, la voix garde sa hauteur)
+    parts.append(f"[cv]setpts=PTS/{MONTAGE_SPEED},fps={MONTAGE_FPS}[outv]")
+    parts.append(f"[ca]{_atempo_chain(MONTAGE_SPEED)},volume={MONTAGE_VOICE_VOLUME}[sa]")
+
+    if music is not None:
+        # La musique démarre avec la vidéo, n'est ni accélérée ni bouclée : si elle est plus
+        # courte, silence après sa fin ; si elle est plus longue, elle s'arrête avec la vidéo.
+        # (apad la prolonge de silence pour que le volume de la voix ne bouge pas à la fin
+        # de la musique ; amix divise par 2 les entrées, volume=2 compense ; le limiteur
+        # évite seulement la saturation, sans modifier le niveau.)
+        inputs += ["-i", str(music)]
+        m = len(clips)
+        parts.append(
+            f"[{m}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={MONTAGE_MUSIC_VOLUME},apad[mus]"
+        )
+        parts.append(
+            "[sa][mus]amix=inputs=2:duration=first:dropout_transition=0,"
+            "volume=2,alimiter=limit=0.95:level=0[outa]"
+        )
+    else:
+        parts.append("[sa]alimiter=limit=0.95:level=0[outa]")
+    graph = ";".join(parts)
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs]
+    if len(graph) > 20000:   # évite la limite de longueur de ligne de commande (Windows)
+        script = Path(tempfile.gettempdir()) / "montage_filter.txt"
+        script.write_text(graph, encoding="utf-8")
+        cmd += ["-filter_complex_script", str(script)]
+    else:
+        cmd += ["-filter_complex", graph]
+    cmd += [
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+        str(out_path),
+    ]
+    return cmd
+
+
+def _run_montage(clips, out_path, log):
+    """Lance FFmpeg et indique le résultat."""
+    started = time.time()
+    if MONTAGE_MUSIC and _find_music() is None:
+        log(f"Musique « {MONTAGE_MUSIC} » introuvable (dossier courant ou à côté de "
+            f"main.py) : montage sans musique.", "#ffaa00")
+    proc = _run_capture(_montage_command(clips, out_path))
+    if proc.returncode == 0:
+        total = sum(c["end"] - c["start"] for c in clips) / MONTAGE_SPEED
+        music = "avec musique" if _find_music() else "sans musique"
+        log(f"Montage terminé en {int(time.time() - started)} s "
+            f"({len(clips)} morceau(x), {total:.1f} s à x{MONTAGE_SPEED:g}, {music}) "
+            f": {out_path}", "#55ff55")
+        return True
+    tail = "\n".join(proc.stderr.strip().splitlines()[-6:])
+    log(f"Échec FFmpeg :\n{tail}", "#ff5555")
+    return False
+
+
+# ---------- éditeur graphique ----------
+
+class MontageEditor:
+    BG, FG, FIELD = "#1e1e1e", "#ffffff", "#2d2d2d"
+    ACCENT, ORANGE, RED, BLUE = "#00ff88", "#ffaa00", "#ff4444", "#3399ff"
+    TL_PAD = 14          # marge gauche/droite de la frise
+    HANDLE_GRAB = 9      # distance (px) pour attraper une poignée
+
+    def __init__(self, folder, out_path, clips):
+        self.folder, self.out_path, self.clips = folder, out_path, clips
+        self.tmp = Path(tempfile.mkdtemp(prefix="montage_"))
+        self.settings_path = folder / "_montage.json"
+        try:
+            self.saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            self.saved = {}
+
+        self.segments = {}          # index du clip -> [[début, fin], ...]
+        self.frames_count = {}      # index du clip -> nombre d'images d'aperçu
+        self.extracting = set()
+        self.index = 0
+        self.t = 0.0
+        self.sel_seg = None
+        self.sel_range = None
+        self.drag = None
+        self.playing = False
+        self.audio = None           # processus ffplay (hors Windows)
+        self.mci_open = False       # fichier audio ouvert dans MCI
+        self.mci_playing = False    # le son est en cours de lecture
+        self.closed = False
+        self.busy = False
+        self._shown = None
+        self._thumbs = {}
+        self.photo = None
+
+        self._build_ui()
+        self.show_clip(0)
+
+    # ----- construction de la fenêtre -----
+    def _build_ui(self):
+        BG, FG, FIELD = self.BG, self.FG, self.FIELD
+        w = self.win = tk.Toplevel(root)
+        w.title("Montage vidéo")
+        w.configure(bg=BG)
+        w.geometry("900x780")
+        w.minsize(700, 620)
+
+        self.title_var = tk.StringVar()
+        self.info_var = tk.StringVar()
+        tk.Label(w, textvariable=self.title_var, bg=BG, fg=FG,
+                 font=("Segoe UI", 13, "bold")).pack(pady=(10, 0))
+        tk.Label(w, textvariable=self.info_var, bg=BG, fg="#aaaaaa").pack()
+
+        holder = tk.Frame(w, bg="#000000", height=self.clips[0]["disp_max_h"])
+        holder.pack(fill="x", padx=14, pady=8)
+        holder.pack_propagate(False)
+        self.video_label = tk.Label(holder, bg="#000000", fg="#888888",
+                                    text="Chargement de l'aperçu...")
+        self.video_label.pack(expand=True)
+
+        self.thumb_h = max(c["thumb_h"] for c in self.clips)
+        self.canvas = tk.Canvas(w, height=self.thumb_h + 52, bg="#111111",
+                                highlightthickness=0)
+        self.canvas.pack(fill="x", padx=14)
+        self.canvas.bind("<Button-1>", lambda e: self.on_press(e, bool(e.state & 1)))
+        self.canvas.bind("<B1-Motion>", self.on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Configure>", lambda e: self.redraw())
+
+        self.time_var = tk.StringVar()
+        tk.Label(w, textvariable=self.time_var, bg=BG, fg=self.ORANGE,
+                 font=("Consolas", 11)).pack(pady=(6, 0))
+
+        bar = tk.Frame(w, bg=BG)
+        bar.pack(pady=(8, 2))
+        bar2 = tk.Frame(w, bg=BG)
+        bar2.pack(pady=(2, 8))
+
+        def button(parent, text, command, bg=FIELD, fg=FG):
+            b = tk.Button(parent, text=text, command=command, bg=bg, fg=fg, relief="flat",
+                          padx=10, pady=5, takefocus=0)
+            b.pack(side="left", padx=3)
+            return b
+
+        button(bar, "▶ Lecture (Espace)", self.toggle_play)
+        button(bar, "✂ Couper (C)", self.split)
+        button(bar, "Début ici (I)", self.mark_in)
+        button(bar, "Fin ici (O)", self.mark_out)
+        button(bar, "🗑 Supprimer (Suppr)", self.delete)
+        button(bar2, "◀ Précédente", self.previous)
+        button(bar2, "↺ Tout remettre (R)", self.reset)
+        self.next_btn = button(bar2, "Valider ▶ (Entrée)", self.next,
+                               bg=self.ACCENT, fg="#000000")
+
+        self.status = tk.StringVar(value="")
+        tk.Label(w, textvariable=self.status, bg=BG, fg=self.ORANGE, wraplength=860,
+                 justify="left").pack(fill="x", padx=14)
+        tk.Label(w, text="Frise : clic = se déplacer · glisser une poignée verte = ajuster "
+                         "· Maj + glisser = zone à supprimer",
+                 bg=BG, fg="#777777").pack(pady=(2, 8))
+
+        w.bind("<Key>", self.on_key)
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        w.focus_force()
+
+    # ----- images d'aperçu (extraites une fois par clip, en arrière-plan) -----
+    def _ensure_frames(self, i):
+        if i >= len(self.clips) or i in self.frames_count or i in self.extracting:
+            return
+        self.extracting.add(i)
+        clip = self.clips[i]
+        fw, fh = clip["disp"]
+        out_dir = self.tmp / f"c{i}"
+
+        def work():
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if _MCI_OK and clip["has_audio"]:
+                # piste audio complète en WAV : MCI la lit sans délai et donne sa position
+                _run_capture([
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(clip["path"]),
+                    "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
+                    str(out_dir / "audio.wav"),
+                ])
+            _run_capture([
+                "ffmpeg", "-y", "-loglevel", "error", "-i", str(clip["path"]), "-an",
+                "-vf", f"fps={MONTAGE_PREVIEW_FPS},scale={fw}:{fh}",
+                "-compression_level", "1", str(out_dir / "%04d.png"),
+            ])
+            self.frames_count[i] = len(list(out_dir.glob("*.png")))
+            self.extracting.discard(i)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _wait_frames(self, i):
+        if self.closed or i != self.index:
+            return
+        if i in self.frames_count:
+            self._shown = None
+            if self.frames_count[i] == 0:
+                self.status.set("Aperçu indisponible pour cette vidéo (FFmpeg a échoué).")
+            self._open_audio()
+            self.show_frame()
+            self.redraw()
+            self._ensure_frames(i + 1)      # précharge la suivante
+            return
+        self.win.after(100, lambda: self._wait_frames(i))
+
+    def show_frame(self):
+        n = self.frames_count.get(self.index)
+        if not n:
+            return
+        k = min(n, max(1, int(self.t * MONTAGE_PREVIEW_FPS) + 1))
+        if k == self._shown:
+            return
+        try:
+            img = tk.PhotoImage(file=str(self.tmp / f"c{self.index}" / f"{k:04d}.png"))
+        except tk.TclError:
+            return
+        self.photo = img
+        self.video_label.config(image=img, text="")
+        self._shown = k
+
+    def _thumb(self, k):
+        if k not in self._thumbs:
+            clip = self.clips[self.index]
+            try:
+                img = tk.PhotoImage(
+                    file=str(self.tmp / f"c{self.index}" / f"{k:04d}.png")
+                ).subsample(clip["thumb_factor"])
+            except tk.TclError:
+                img = None
+            self._thumbs[k] = img
+        return self._thumbs[k]
+
+    # ----- navigation entre les clips -----
+    def show_clip(self, i):
+        self.pause()
+        self._close_audio()
+        self.index = i
+        clip = self.clips[i]
+        self.t = 0.0
+        self.sel_seg = self.sel_range = None
+        self._shown = None
+        self._thumbs = {}
+        self.photo = None
+        self.video_label.config(image="", text="Chargement de l'aperçu...")
+
+        if i not in self.segments:
+            saved = self.saved.get(clip["path"].name, {}).get("segments")
+            if saved is not None:
+                segs = [[max(0.0, float(s)), min(clip["duration"], float(e))]
+                        for s, e in saved]
+            else:
+                segs = [[0.0, clip["duration"]]]
+            self.segments[i] = segs
+
+        self.title_var.set(f"Vidéo {i + 1} / {len(self.clips)} — {clip['path'].name}")
+        self.info_var.set(f"Durée : {clip['duration']:.2f} s")
+        self.next_btn.config(text="Assembler ▶ (Entrée)" if i == len(self.clips) - 1
+                             else "Valider ▶ (Entrée)")
+        self.status.set("")
+        self._ensure_frames(i)
+        self._wait_frames(i)
+        self.redraw()
+
+    def _store(self):
+        """Mémorise les découpes du clip courant (mémoire + fichier)."""
+        self.segments[self.index] = [list(s) for s in self.segments[self.index]]
+        data = {}
+        for i, segs in self.segments.items():
+            data[self.clips[i]["path"].name] = {
+                "segments": [[round(s, 3), round(e, 3)] for s, e in segs]}
+        self.saved.update(data)
+        try:
+            self.settings_path.write_text(
+                json.dumps(self.saved, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def previous(self):
+        if self.busy or self.index == 0:
+            return
+        self._store()
+        self.show_clip(self.index - 1)
+
+    def next(self):
+        if self.busy:
+            return
+        self.pause()
+        self._store()
+        if self.index + 1 < len(self.clips):
+            self.show_clip(self.index + 1)
+        else:
+            self.finish()
+
+    def finish(self):
+        flat = []
+        for i, clip in enumerate(self.clips):
+            for s, e in self.segments.get(i, []):
+                flat.append({**clip, "start": s, "end": e})
+        if not flat:
+            self.status.set("Aucun morceau gardé : rien à assembler.")
+            return
+        self.busy = True
+        self.next_btn.config(state="disabled", text="Assemblage...")
+        self.status.set("Assemblage en cours, patiente (détails dans le terminal)...")
+        log = self.log
+        log(f"Montage de {len(flat)} morceau(x) -> {self.out_path}", "#ffaa00")
+
+        def work():
+            try:
+                ok = _run_montage(flat, self.out_path, log)
+            except Exception as exc:
+                log(f"Erreur montage : {type(exc).__name__}: {exc}", "#ff5555")
+                ok = False
+
+            def done():
+                if self.closed:
+                    return
+                if ok:
+                    self.close()
+                else:
+                    self.busy = False
+                    self.next_btn.config(state="normal", text="Assembler ▶ (Entrée)")
+                    self.status.set("Échec de l'assemblage, voir le terminal.")
+            try:
+                root.after(0, done)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def log(self, message, color=None):
+        try:
+            root.after(0, lambda m=message, c=color: terminal_print(m, c))
+        except Exception:
+            print(message)
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            self._store()
+        except Exception:
+            pass
+        self.closed = True
+        self.pause()
+        self._close_audio()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ----- géométrie de la frise -----
+    @property
+    def segs(self):
+        return self.segments[self.index]
+
+    @property
+    def dur(self):
+        return self.clips[self.index]["duration"]
+
+    def _tl_x(self):
+        width = max(self.canvas.winfo_width(), 200)
+        return self.TL_PAD, width - self.TL_PAD
+
+    def t2x(self, t):
+        x0, x1 = self._tl_x()
+        return x0 + (t / self.dur) * (x1 - x0)
+
+    def x2t(self, x):
+        x0, x1 = self._tl_x()
+        return min(self.dur, max(0.0, (x - x0) / (x1 - x0) * self.dur))
+
+    def _segment_at(self, t):
+        for k, (s, e) in enumerate(self.segs):
+            if s <= t < e:
+                return k
+        return None
+
+    # ----- dessin -----
+    def redraw(self):
+        if self.closed:
+            return
+        c = self.canvas
+        c.delete("all")
+        x0, x1 = self._tl_x()
+        top = 18
+        clip = self.clips[self.index]
+        bot = top + clip["thumb_h"]
+        dur = self.dur
+
+        n = self.frames_count.get(self.index, 0)
+        if n:
+            tw = max(1, clip["disp"][0] // clip["thumb_factor"])
+            count = max(1, round((x1 - x0) / tw))
+            for k in range(count):
+                frame = min(n, max(1, int((k + 0.5) / count * dur * MONTAGE_PREVIEW_FPS) + 1))
+                img = self._thumb(frame)
+                if img is not None:
+                    c.create_image(x0 + k * (x1 - x0) / count, top, image=img, anchor="nw")
+        else:
+            c.create_rectangle(x0, top, x1, bot, fill="#222222", outline="")
+
+        # parties supprimées (assombries)
+        prev = 0.0
+        for s, e in list(self.segs) + [(dur, dur)]:
+            if s > prev:
+                c.create_rectangle(self.t2x(prev), top, self.t2x(s), bot,
+                                   fill="#000000", stipple="gray75", outline="")
+            prev = e
+
+        # morceaux gardés + poignées
+        for k, (s, e) in enumerate(self.segs):
+            color = self.ORANGE if k == self.sel_seg else self.ACCENT
+            c.create_rectangle(self.t2x(s), top, self.t2x(e), bot, outline=color, width=2)
+            for t in (s, e):
+                x = self.t2x(t)
+                c.create_rectangle(x - 3, top - 4, x + 3, bot + 4, fill=color, outline="")
+
+        # zone sélectionnée à la souris (Maj + glisser)
+        if self.sel_range:
+            a, b = self.sel_range
+            c.create_rectangle(self.t2x(a), top, self.t2x(b), bot, fill=self.BLUE,
+                               stipple="gray50", outline=self.BLUE, width=2)
+
+        # règle graduée
+        step = 1 if dur <= 20 else 5
+        t = 0
+        while t <= dur:
+            x = self.t2x(t)
+            c.create_line(x, bot + 6, x, bot + 12, fill="#888888")
+            c.create_text(x, bot + 24, text=f"{t:g}s", fill="#888888", font=("Segoe UI", 8))
+            t += step
+
+        self._draw_playhead()
+
+    def _draw_playhead(self):
+        c = self.canvas
+        c.delete("ph")
+        x = self.t2x(self.t)
+        bot = 18 + self.clips[self.index]["thumb_h"]
+        c.create_line(x, 6, x, bot + 8, fill=self.RED, width=2, tags="ph")
+        c.create_polygon(x - 6, 0, x + 6, 0, x, 10, fill=self.RED, outline="", tags="ph")
+        kept = sum(e - s for s, e in self.segs)
+        self.time_var.set(f"{self.t:6.2f} s / {self.dur:.2f} s    |    "
+                          f"gardé : {kept:.2f} s ({len(self.segs)} morceau(x))")
+
+    # ----- souris -----
+    def _hit_handle(self, x):
+        best, best_score = None, None
+        for k, (s, e) in enumerate(self.segs):
+            for which, t in (("s", s), ("e", e)):
+                px = self.t2x(t)
+                d = abs(px - x)
+                if d > self.HANDLE_GRAB:
+                    continue
+                # poignées superposées (morceaux collés) : celle du côté de la souris
+                score = d + (0 if (which == "e") == (x <= px) else 0.5)
+                if best_score is None or score < best_score:
+                    best, best_score = (k, which), score
+        return best
+
+    def on_press(self, event, shift):
+        self.win.focus_set()
+        self.pause()
+        t = self.x2t(event.x)
+        if shift:
+            self.drag = ("range", t)
+            self.sel_range = (t, t)
+            self.redraw()
+            return
+        handle = self._hit_handle(event.x)
+        if handle:
+            self.drag = ("handle", *handle)
+            return
+        self.drag = ("scrub",)
+        self.sel_range = None
+        self.sel_seg = self._segment_at(t)
+        self.seek(t)
+        self.redraw()
+
+    def on_motion(self, event):
+        if not self.drag:
+            return
+        t = self.x2t(event.x)
+        kind = self.drag[0]
+        if kind == "range":
+            a = self.drag[1]
+            self.sel_range = (min(a, t), max(a, t))
+            self.redraw()
+        elif kind == "scrub":
+            self.seek(t)
+        elif kind == "handle":
+            k, which = self.drag[1], self.drag[2]
+            segs = self.segs
+            if which == "s":
+                lo = segs[k - 1][1] if k > 0 else 0.0
+                hi = segs[k][1] - MONTAGE_MIN_SEGMENT
+                segs[k][0] = min(hi, max(lo, t))
+                self.t = segs[k][0]
+            else:
+                lo = segs[k][0] + MONTAGE_MIN_SEGMENT
+                hi = segs[k + 1][0] if k + 1 < len(segs) else self.dur
+                segs[k][1] = min(hi, max(lo, t))
+                self.t = segs[k][1]
+            self.show_frame()
+            self.redraw()
+
+    def on_release(self, event):
+        if self.drag and self.drag[0] == "range":
+            a, b = self.sel_range
+            if b - a < 0.05:
+                self.sel_range = None
+        self.drag = None
+        self.redraw()
+
+    # ----- lecture -----
+    def seek(self, t):
+        self.t = min(self.dur, max(0.0, t))
+        self.show_frame()
+        self._draw_playhead()
+
+    def _next_valid(self, t):
+        for s, e in self.segs:
+            if s <= t < e:
+                return t
+            if s > t:
+                return s
+        return None
+
+    def _open_audio(self):
+        """Ouvre le WAV du clip courant dans MCI (Windows)."""
+        self._close_audio()
+        if not _MCI_OK:
+            return
+        wav = self.tmp / f"c{self.index}" / "audio.wav"
+        if not wav.exists():                     # clip sans son
+            return
+        err, _ = _mci(f'open "{wav}" type waveaudio alias {_MCI_ALIAS}')
+        if err == 0:
+            _mci(f"set {_MCI_ALIAS} time format milliseconds")
+            self.mci_open = True
+
+    def _close_audio(self):
+        if self.mci_open:
+            _mci(f"stop {_MCI_ALIAS}")
+            _mci(f"close {_MCI_ALIAS}")
+        self.mci_open = False
+        self.mci_playing = False
+
+    def _start_audio(self, t):
+        """Lance le son de t jusqu'à la fin du morceau gardé qui contient t."""
+        self._stop_audio()
+        k = self._segment_at(t)
+        if k is None:
+            return
+        end = self.segs[k][1]
+
+        if self.mci_open:
+            if int(end * 1000) <= int(t * 1000):
+                return
+            err, _ = _mci(f"play {_MCI_ALIAS} from {int(t * 1000)} to {int(end * 1000)}")
+            if err == 0:
+                self.mci_playing = True
+                self._audio_end = end
+                self._audio_from = t
+                self._est = t                      # position estimée du son
+                self._last_wall = self._audio_started = time.time()
+            return
+
+        if _MCI_OK or not shutil.which("ffplay"):
+            return
+        try:
+            self.audio = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-ss", f"{t:.3f}", "-t", f"{end - t:.3f}",
+                 str(self.clips[self.index]["path"])],
+                stdin=subprocess.DEVNULL, **_no_window())
+        except OSError:
+            self.audio = None
+
+    def _stop_audio(self):
+        if self.mci_playing:
+            _mci(f"stop {_MCI_ALIAS}")
+        self.mci_playing = False
+        if self.audio is not None:
+            try:
+                self.audio.terminate()
+                self.audio.wait(timeout=1)
+            except Exception:
+                try:
+                    self.audio.kill()
+                except Exception:
+                    pass
+            self.audio = None
+
+    def toggle_play(self):
+        if self.playing:
+            self.pause()
+            return
+        if self.index not in self.frames_count:
+            self.status.set("Chargement de l'aperçu, patiente une seconde...")
+            return
+        if not self.segs:
+            self.status.set("Rien à lire : aucun morceau gardé.")
+            return
+        self.status.set("")
+        start = self._next_valid(self.t)
+        if start is None:                      # fin atteinte : on repart du début
+            start = self.segs[0][0]
+        self.t = start
+        self._start_audio(start)
+        self.playing = True
+        self._play_wall, self._play_media = time.time(), start
+        self._tick()
+
+    def pause(self):
+        self.playing = False
+        self._stop_audio()
+
+    def _audio_time(self, now):
+        """Temps de lecture déduit de la position RÉELLE du son (None = son terminé)."""
+        err, mode = _mci(f"status {_MCI_ALIAS} mode")
+        if err != 0 or mode != "playing":
+            # fini (ou pas encore démarré : on laisse 0,2 s de grâce)
+            if now - self._audio_started > 0.2:
+                self.mci_playing = False
+                return None
+            return self._est
+        _, pos = _mci(f"status {_MCI_ALIAS} position")
+        try:
+            p = int(pos) / 1000.0 + MONTAGE_AUDIO_OFFSET
+        except ValueError:
+            p = None
+        # le son n'a pas encore commencé à avancer : l'image attend (1 s maximum)
+        if p is not None and p - self._audio_from < 0.001 and now - self._audio_started < 1.0:
+            self._est, self._last_wall = self._audio_from, now
+            return self._audio_from
+        est = self._est + (now - self._last_wall)      # avance fluide entre deux lectures
+        if p is not None:
+            est += 0.3 * (p - est)                     # recalage sur la position réelle du son
+        self._est, self._last_wall = est, now
+        # tant que le son joue, on reste dans le morceau : sa fin n'est jamais coupée
+        return min(est, self._audio_end - 0.001)
+
+    def _tick(self):
+        if not self.playing or self.closed:
+            return
+        now = time.time()
+        if self.mci_playing:
+            t = self._audio_time(now)
+            if t is None:                      # le son a joué jusqu'au bout du morceau
+                t = self._audio_end
+        else:
+            t = self._play_media + (now - self._play_wall)
+
+        if self._segment_at(t) is None:
+            nxt = self._next_valid(t)
+            if nxt is None:                    # fin du dernier morceau
+                self.pause()
+                self.t = self.segs[-1][1]
+                self.show_frame()
+                self._draw_playhead()
+                return
+            t = nxt                            # saute la partie supprimée
+            self._start_audio(t)
+            self._play_wall, self._play_media = time.time(), t
+        self.t = t
+        self.show_frame()
+        self._draw_playhead()
+        self.win.after(10, self._tick)
+
+    # ----- édition -----
+    def split(self):
+        self.segments[self.index] = [list(s) for s in _seg_split(self.segs, self.t)]
+        self.sel_seg = None
+        self.redraw()
+
+    def delete(self):
+        if self.sel_range:
+            a, b = self.sel_range
+            self.segments[self.index] = [list(s) for s in _seg_subtract(self.segs, a, b)]
+            self.sel_range = None
+        elif self.sel_seg is not None and self.sel_seg < len(self.segs):
+            del self.segs[self.sel_seg]
+            self.sel_seg = None
+        else:
+            self.status.set("Sélectionne d'abord une zone (Maj + glisser) "
+                            "ou clique sur un morceau.")
+            return
+        self.status.set("")
+        self.redraw()
+
+    def mark_in(self):
+        k = self._segment_at(self.t)
+        if k is not None and self.t < self.segs[k][1] - MONTAGE_MIN_SEGMENT:
+            self.segs[k][0] = self.t
+            self.redraw()
+
+    def mark_out(self):
+        for k, (s, e) in enumerate(self.segs):
+            if s + MONTAGE_MIN_SEGMENT < self.t <= e:
+                self.segs[k][1] = self.t
+                self.redraw()
+                return
+
+    def reset(self):
+        self.segments[self.index] = [[0.0, self.dur]]
+        self.sel_seg = self.sel_range = None
+        self.redraw()
+
+    def on_key(self, event):
+        key = event.keysym
+        shift = bool(event.state & 1)
+        if key in ("Return", "KP_Enter"):
+            self.next()
+        elif key == "space":
+            self.toggle_play()
+        elif key in ("Left", "Right"):
+            self.pause()
+            step = 1.0 if shift else 1.0 / MONTAGE_PREVIEW_FPS
+            self.seek(self.t + (step if key == "Right" else -step))
+        elif key in ("Delete", "BackSpace"):
+            self.delete()
+        elif key.lower() == "c":
+            self.split()
+        elif key.lower() == "i":
+            self.mark_in()
+        elif key.lower() == "o":
+            self.mark_out()
+        elif key.lower() == "r":
+            self.reset()
+
+
+def cmd_montage(args):
+    args = [a.strip().strip('"') for a in args]
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise RuntimeError(
+            "FFmpeg introuvable : installe-le et ajoute ffmpeg/ffprobe au PATH."
+        )
+
+    folder = Path(args[0]) if args else Path(VIDEO_FOLDER)
+    out_path = Path(args[1]) if len(args) > 1 else Path("montage.mp4")
+    if not folder.is_dir():
+        raise RuntimeError(f"Dossier introuvable : {folder}")
+
+    files = sorted(
+        (p for p in folder.iterdir()
+         if p.is_file() and p.stem.isdigit() and p.suffix.lower() in _MONTAGE_EXTS),
+        key=lambda p: int(p.stem),
+    )
+    if not files:
+        raise RuntimeError(f"Aucune vidéo numérotée (1.mp4, 2.mp4...) dans {folder}")
+
+    max_w, max_h, thumb_target = 640, 380, 64
+    clips = []
+    for path in files:
+        try:
+            duration, has_audio, (w, h) = _probe_clip(path)
+        except Exception as exc:
+            terminal_print(f"{path.name} ignorée (illisible) : {exc}", "#ffaa00")
+            continue
+        scale = min(max_w / w, max_h / h, 1.0)
+        fw, fh = max(2, int(w * scale) // 2 * 2), max(2, int(h * scale) // 2 * 2)
+        factor = max(1, round(fh / thumb_target))
+        clips.append({
+            "path": path, "duration": duration, "has_audio": has_audio,
+            "size": (w, h), "disp": (fw, fh), "disp_max_h": max_h,
+            "thumb_factor": factor, "thumb_h": fh // factor,
+        })
+    if not clips:
+        raise RuntimeError("Aucune vidéo lisible.")
+
+    terminal_print(f"{len(clips)} vidéo(s) chargée(s) : fenêtre de montage ouverte.",
+                   "#55ff55")
+    MontageEditor(folder, out_path, clips)
+
+
+# ============================================================
 # LANGAGE CD : EDITEUR ET EXECUTION DE SCRIPTS
 # ============================================================
 
@@ -1942,12 +3315,17 @@ cd_editors = []
 def cd_command_runner(log):
     def run_line(line, env, interpreter):
         expanded = line
-        for name in sorted(env, key=len, reverse=True):
-            value = env[name]
-            replacement = shlex.quote(str(value))
-            expanded = re.sub(
-                rf'(?<![\w\[])\b{re.escape(name)}\b(?![\w\]])',
-                replacement, expanded
+        if env:
+            # Une seule passe, avec une fonction de remplacement : les valeurs
+            # (chemins Windows avec « \ », texte contenant le nom d'une autre
+            # variable...) sont insérées telles quelles, sans être réinterprétées.
+            names = sorted(env, key=len, reverse=True)
+            pattern = re.compile(
+                r'(?<![\w\[])\b(?:' + '|'.join(re.escape(n) for n in names)
+                + r')\b(?![\w\]])'
+            )
+            expanded = pattern.sub(
+                lambda m: shlex.quote(str(env[m.group(0)])), line
             )
         try:
             parts = shlex.split(expanded)
@@ -1959,14 +3337,128 @@ def cd_command_runner(log):
         if command == 'print':
             log(' '.join(args))
         elif command in COMMANDS:
-            COMMANDS[command](args)
+            # Les commandes longues (gen_image, save, delflow...) travaillent dans
+            # un thread et rendent la main tout de suite. Dans un script CD on
+            # attend la fin de ces threads avant de passer à la ligne suivante.
+            before = set(threading.enumerate())
+            result = COMMANDS[command](args)
+            wait_for_new_threads(before)
+            return result  # permet : variable = commande args
         else:
             raise RuntimeError(f"Commande CD inconnue : {command}")
     return run_line
 
 
+def wait_for_new_threads(before):
+    """Attend la fin des threads lancés depuis `before`, sans geler l'interface.
+
+    On ne peut pas faire un simple join() dans le thread Tk : les threads de
+    travail écrivent dans le terminal via Tk, ce qui bloquerait (deadlock).
+    On fait donc tourner la boucle d'événements pendant l'attente.
+    """
+    new_threads = [t for t in threading.enumerate()
+                   if t not in before and t.is_alive()]
+    on_main = threading.current_thread() is threading.main_thread()
+    for t in new_threads:
+        while t.is_alive():
+            if on_main:
+                try:
+                    root.update()
+                except tk.TclError:  # fenêtre fermée pendant l'attente
+                    return
+                time.sleep(0.05)
+            else:
+                t.join(0.2)
+
+
 def create_cd_interpreter(log):
-    return CDInterpreter(cd_command_runner(log), log)
+    return CDInterpreter(
+        cd_command_runner(log), log,
+        is_command=lambda name: name.lower() in COMMANDS
+    )
+
+
+# ============================================================
+# pick : choisit une image par scène et renvoie leurs chemins
+# ============================================================
+# Utilisation :
+#   pick 1 3 2                  -> scène 1 : image A, scène 2 : image C, scène 3 : image B
+#   pick 4-6 1 3 2              -> scènes 4 à 6 : A, C, B   (intervalle de scènes)
+#   pick 4- 1 3 2               -> à partir de la scène 4, autant de scènes que de choix
+#   pick "dossier" 4-6 1 3 2    -> même chose dans un autre dossier (défaut : flow_media)
+#
+# Sans intervalle, on commence à la scène 1 (comportement d'origine).
+# Avec "a-b", il faut exactement (b - a + 1) choix.
+#
+# Dans un script CD, le résultat se stocke dans un tableau :
+#   images = pick 4-6 1 3 2
+#   print(images[0])
+#
+# Les chemins sont relatifs au dossier courant du terminal.
+
+_PICK_RANGE = re.compile(r"^(\d+)-(\d*)$")
+
+
+def cmd_pick(args):
+    args = [a.strip().strip('"') for a in args]
+    folder = Path("flow_media")
+
+    # Un premier argument qui n'est ni un chiffre ni un intervalle = dossier
+    if args and not args[0].isdigit() and not _PICK_RANGE.match(args[0]):
+        folder = Path(args[0])
+        args = args[1:]
+
+    # Intervalle de scènes optionnel : "4-6" ou "4-"
+    first_scene = 1
+    last_scene = None
+    if args:
+        m = _PICK_RANGE.match(args[0])
+        if m:
+            first_scene = int(m.group(1))
+            last_scene = int(m.group(2)) if m.group(2) else None
+            args = args[1:]
+
+    if not args:
+        terminal_print('Usage : pick [a-b] 1 3 2   (un chiffre 1-3 par scène : A, B ou C)',
+                       "#ffaa00")
+        terminal_print('Exemples : pick 1 3 2   |   pick 4-6 2 1 3', "#ffaa00")
+        return None
+
+    if first_scene < 1:
+        raise RuntimeError("Les scènes commencent à 1.")
+    if last_scene is None:
+        last_scene = first_scene + len(args) - 1
+    if last_scene < first_scene:
+        raise RuntimeError(
+            f"Intervalle invalide : {first_scene}-{last_scene}."
+        )
+    expected = last_scene - first_scene + 1
+    if len(args) != expected:
+        raise RuntimeError(
+            f"Scènes {first_scene} à {last_scene} : {expected} choix attendus, "
+            f"{len(args)} reçu(s)."
+        )
+
+    if not folder.is_dir():
+        raise RuntimeError(f"Dossier introuvable : {folder}")
+
+    paths = []
+    for scene, choice in zip(range(first_scene, last_scene + 1), args):
+        if choice not in ("1", "2", "3"):
+            raise RuntimeError(
+                f"Scène {scene} : « {choice} » invalide, choisis 1, 2 ou 3."
+            )
+        letter = "ABC"[int(choice) - 1]
+        matches = sorted(folder.glob(f"scene_{scene}_{letter}.*"))
+        if not matches:
+            raise RuntimeError(
+                f"Image introuvable : scene_{scene}_{letter} dans {folder}"
+            )
+        paths.append(os.path.relpath(matches[0]))
+
+    for p in paths:
+        terminal_print(p, "#55ff55")
+    return paths
 
 
 def cmd_cedit(args):
@@ -2047,8 +3539,11 @@ COMMANDS = {
     "cproject": cmd_cproject,
     "gen_image": cmd_gen_image,
     "save": cmd_save,
+    "save_video": cmd_save_video,
+    "montage": cmd_montage,
     "delflow": cmd_delflow,
     "gen_video": cmd_gen_video,
+    "pick": cmd_pick,
 
     "cedit": cmd_cedit,
     "run": cmd_run_cd,
@@ -2066,7 +3561,9 @@ def cmd_help(args):
     for command in COMMANDS:
         terminal_print(f"  {command}")
     terminal_print("")
-    terminal_print("exit / quit  -> fermer le terminal", "#ffaa00")
+    terminal_print("exit / quit  -> fermer cet onglet", "#ffaa00")
+    terminal_print("term / tab   -> nouvel onglet (ou Ctrl+T)", "#ffaa00")
+    terminal_print("Ctrl+W ferme l'onglet · Ctrl+Tab change d'onglet · Alt+1..9 va à l'onglet n", "#ffaa00")
     terminal_print("")
 
 
@@ -2074,7 +3571,26 @@ COMMANDS["help"] = cmd_help
 
 
 # ============================================================
-# HISTORIQUE PERSISTANT + AUTOCOMPLÉTION
+# ONGLETS
+# ============================================================
+
+def _terminal_launch_command():
+    if getattr(sys, "frozen", False):                 # application empaquetée (.exe)
+        return [sys.executable]
+    return [sys.executable, str(Path(sys.argv[0] or __file__).resolve())]
+
+
+def cmd_term(args):
+    """Ouvre un nouvel onglet (dans le dossier courant)."""
+    _emit({"e": "new_tab"})
+
+
+COMMANDS["term"] = cmd_term
+COMMANDS["tab"] = cmd_term
+
+
+# ============================================================
+# HISTORIQUE PERSISTANT (partagé entre tous les onglets)
 # ============================================================
 
 HISTORY_FILE = Path.home() / ".clem_terminal_history.json"
@@ -2090,149 +3606,53 @@ def load_command_history():
 
 
 command_history = load_command_history()
-history_index = len(command_history)
-history_draft = ""
-tab_matches = []
-tab_index = 0
-tab_original = ""
 
 
 def save_command_history():
+    # Les onglets (et plusieurs fenêtres) partagent ce fichier : on y AJOUTE la dernière
+    # commande au lieu de l'écraser avec l'historique d'un seul onglet.
     try:
+        merged = load_command_history()
+        if command_history and (not merged or merged[-1] != command_history[-1]):
+            merged.append(command_history[-1])
         HISTORY_FILE.write_text(
-            json.dumps(command_history[-HISTORY_LIMIT:], ensure_ascii=False, indent=2),
+            json.dumps(merged[-HISTORY_LIMIT:], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
     except OSError as exc:
         terminal_print(f"Impossible de sauvegarder l'historique : {exc}", "#ffaa00")
 
 
-def reset_completion():
-    global tab_matches, tab_index, tab_original
-    tab_matches = []
-    tab_index = 0
-    tab_original = ""
-
-
-def complete_command(event=None):
-    """Complète les commandes et les chemins de fichiers/dossiers avec Tab."""
-    global tab_matches, tab_index, tab_original
-    current = command_entry.get()
-    cursor = command_entry.index(tk.INSERT)
-    before = current[:cursor]
-    token_start = max(before.rfind(" "), before.rfind("\t")) + 1
-    raw_token = before[token_start:]
-    quote = raw_token[:1] if raw_token[:1] in ("'", '"') else ""
-    token = raw_token[1:] if quote else raw_token
-
-    if not tab_matches or tab_original != current:
-        tab_original = current
-        tab_index = 0
-        if token_start == 0 and not any(sep in token for sep in (os.sep, "/", "\\")):
-            candidates = [name for name in COMMANDS if name.startswith(token.lower())]
-        else:
-            expanded = os.path.expanduser(token)
-            directory_part = os.path.dirname(expanded)
-            basename = os.path.basename(expanded)
-            search_dir = Path(directory_part) if directory_part else Path.cwd()
-            try:
-                entries = list(search_dir.iterdir())
-            except (OSError, PermissionError):
-                entries = []
-            candidates = []
-            for entry in entries:
-                if entry.name.lower().startswith(basename.lower()):
-                    candidate = (str(Path(directory_part) / entry.name)
-                                 if directory_part else entry.name)
-                    if entry.is_dir():
-                        candidate += os.sep
-                    candidates.append(candidate)
-            candidates.sort(key=str.lower)
-        tab_matches = candidates
-
-    if not tab_matches:
-        return "break"
-
-    candidate = tab_matches[tab_index % len(tab_matches)]
-    tab_index += 1
-    if quote:
-        candidate = quote + candidate
-        if not candidate.endswith(os.sep):
-            candidate += quote
-    elif " " in candidate:
-        candidate = '"' + candidate + ('"' if not candidate.endswith(os.sep) else '')
-    new_value = current[:token_start] + candidate + current[cursor:]
-    command_entry.delete(0, tk.END)
-    command_entry.insert(0, new_value)
-    command_entry.icursor(token_start + len(candidate))
-    return "break"
-
-
-def history_up(event=None):
-    global history_index, history_draft
-    if not command_history:
-        return "break"
-    if history_index == len(command_history):
-        history_draft = command_entry.get()
-    if history_index > 0:
-        history_index -= 1
-    command_entry.delete(0, tk.END)
-    command_entry.insert(0, command_history[history_index])
-    command_entry.icursor(tk.END)
-    reset_completion()
-    return "break"
-
-
-def history_down(event=None):
-    global history_index, history_draft
-    if history_index < len(command_history):
-        history_index += 1
-    command_entry.delete(0, tk.END)
-    value = (command_history[history_index]
-             if history_index < len(command_history) else history_draft)
-    command_entry.insert(0, value)
-    command_entry.icursor(tk.END)
-    reset_completion()
-    return "break"
-
-
 # ============================================================
-# EXÉCUTER UNE COMMANDE
+# MOTEUR D'UN ONGLET (processus « worker », sans fenêtre)
 # ============================================================
+# Chaque onglet fait tourner ce moteur dans son propre processus : dossier courant
+# indépendant, commandes en parallèle d'un onglet à l'autre. Il reçoit les commandes
+# sur son entrée standard et renvoie son affichage sous forme de lignes JSON.
 
-def execute_command(event=None):
-    command_line = command_entry.get().strip()
+def _emit_cwd():
+    _emit({"e": "cwd", "path": os.getcwd()})
 
+
+def run_command_line(command_line):
+    command_line = command_line.strip()
     if not command_line:
         return
 
-    global history_index, history_draft
-    if not command_history or command_history[-1] != command_line:
-        command_history.append(command_line)
-        command_history[:] = command_history[-HISTORY_LIMIT:]
-        save_command_history()
-    history_index = len(command_history)
-    history_draft = ""
-    reset_completion()
-
     terminal_print(f"{os.getcwd()} > {command_line}", PROMPT_COLOR)
-
-    command_entry.delete(0, tk.END)
 
     try:
         parts = shlex.split(command_line)
     except ValueError:
         terminal_print("Erreur : guillemets incorrects.", "#ff5555")
         return
-
     if not parts:
         return
 
-    command = parts[0]
-    args = parts[1:]
+    command, args = parts[0], parts[1:]
 
     if command.lower() in ("exit", "quit"):
-        root.destroy()
+        _emit({"e": "close"})                  # ferme l'onglet
         return
 
     if command.lower() in COMMANDS:
@@ -2244,10 +3664,431 @@ def execute_command(event=None):
         terminal_print(f"Commande inconnue : {command}", "#ff5555")
         terminal_print("Tape 'help' pour voir les commandes.", "#ffaa00")
 
+    _emit_cwd()
+
+
+def worker_main():
+    global root, _proto_out
+
+    # fd 1 est réservé au protocole : tout autre affichage (print, bibliothèques,
+    # programmes lancés) part vers la sortie d'erreur et ne peut pas le corrompre.
+    proto_fd = os.dup(1)
+    os.dup2(2, 1)
+    _proto_out = os.fdopen(proto_fd, "w", encoding="utf-8", newline="\n")
+
+    root = tk.Tk()
+    root.withdraw()          # le moteur n'a pas de fenêtre : l'affichage est dans l'onglet
+
+    terminal_print("========================================", "#00ff88")
+    terminal_print("          CLEM TERMINAL", "#00ff88")
+    terminal_print("========================================", "#00ff88")
+    terminal_print("")
+    terminal_print("Tape 'help' pour voir les commandes.", "#aaaaaa")
+    terminal_print("")
+    terminal_print(f"Dossier actuel : {os.getcwd()}", PROMPT_COLOR)
+    terminal_print("")
+    _emit_cwd()
+    _emit({"e": "ready"})
+
+    def reader():
+        for raw in sys.stdin.buffer:
+            try:
+                message = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if "cmd" in message:
+                root.after(0, lambda c=message["cmd"]: run_command_line(c))
+            elif message.get("exit"):
+                break
+        root.after(0, root.quit)     # l'onglet est fermé : le moteur s'arrête
+
+    threading.Thread(target=reader, daemon=True).start()
+    root.mainloop()
+
 
 # ============================================================
-# CHOISIR UNE IMAGE DE FOND
+# FENÊTRE À ONGLETS
 # ============================================================
+# Raccourcis : Ctrl+T (ou Ctrl+N, ou la commande « term ») nouvel onglet · Ctrl+W ferme
+# l'onglet · Ctrl+Tab / Ctrl+Maj+Tab changent d'onglet · Alt+1..9 va à l'onglet n.
+
+class TerminalTab:
+    def __init__(self, app, start_cwd):
+        self.app = app
+        self.cwd = start_cwd
+        self.closed = False
+        self.dead = False
+        self.unread = False
+        self.exit_seen = None
+        self.stderr_tail = collections.deque(maxlen=30)
+        self.history_index = len(command_history)
+        self.history_draft = ""
+        self.tab_matches, self.tab_index, self.tab_original = [], 0, ""
+
+        # ---- interface de l'onglet ----
+        self.frame = tk.Frame(app.content, bg=BG_COLOR)
+        terminal_frame = tk.Frame(self.frame, bg=BG_COLOR)
+        terminal_frame.pack(fill="both", expand=True, padx=15, pady=(15, 5))
+        self.text = tk.Text(terminal_frame, bg=BG_COLOR, fg=TEXT_COLOR,
+                            insertbackground=TEXT_COLOR, font=FONT, relief="flat",
+                            borderwidth=0, wrap="word")
+        self.text.pack(fill="both", expand=True)
+
+        input_frame = tk.Frame(self.frame, bg="#111118")
+        input_frame.pack(fill="x", padx=15, pady=15)
+        tk.Label(input_frame, text=">", bg="#111118", fg=PROMPT_COLOR,
+                 font=("Consolas", 12, "bold")).pack(side="left", padx=(10, 5))
+        self.entry = tk.Entry(input_frame, bg=INPUT_COLOR, fg=TEXT_COLOR,
+                              insertbackground=TEXT_COLOR, font=FONT, relief="flat")
+        self.entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 10))
+
+        e = self.entry
+        e.bind("<Return>", self.submit)
+        e.bind("<Tab>", self.complete)
+        e.bind("<Up>", self.history_up)
+        e.bind("<Down>", self.history_down)
+        e.bind("<KeyRelease>", lambda ev: self.reset_completion()
+               if ev.keysym not in ("Tab", "Up", "Down") else None)
+        # raccourcis d'onglets (« break » : évite par ex. Ctrl+T = inverser deux lettres)
+        for keys, action in (
+            (("<Control-t>", "<Control-T>", "<Control-n>", "<Control-N>"), app.new_tab),
+            (("<Control-w>", "<Control-W>"), lambda: app.close_tab(app.active)),
+            (("<Control-Tab>",), lambda: app.cycle(+1)),
+            (("<Control-Shift-Tab>", "<Control-ISO_Left_Tab>"), lambda: app.cycle(-1)),
+        ):
+            for key in keys:
+                try:
+                    e.bind(key, lambda ev, a=action: (a(), "break")[1])
+                except tk.TclError:      # touche inconnue sur ce système (ex : ISO_Left_Tab sous Windows)
+                    pass
+        for n in range(1, 10):
+            try:
+                e.bind(f"<Alt-Key-{n}>", lambda ev, n=n: (app.goto(n - 1), "break")[1])
+            except tk.TclError:
+                pass
+
+        # ---- moteur de l'onglet : un processus dédié ----
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        kwargs = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
+                  "stderr": subprocess.PIPE, "env": env}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        cwd = start_cwd if os.path.isdir(start_cwd) else str(Path.home())
+        self.proc = subprocess.Popen(_terminal_launch_command() + ["--worker"],
+                                     cwd=cwd, **kwargs)
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    # ----- moteur : lecture des événements -----
+    def _read_stdout(self):
+        for raw in self.proc.stdout:
+            try:
+                event = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            self.app.events.put((self, event))
+        self.app.events.put((self, {"e": "eof"}))
+
+    def _read_stderr(self):
+        for raw in self.proc.stderr:
+            self.stderr_tail.append(raw.decode("utf-8", "replace").rstrip())
+
+    def handle(self, event):
+        kind = event.get("e")
+        if kind == "print":
+            self.write(event.get("text", ""), event.get("color"))
+            if self is not self.app.active and not self.unread:
+                self.unread = True
+                self.app.refresh_tabs()
+        elif kind == "clear":
+            self.text.delete("1.0", tk.END)
+        elif kind == "cwd":
+            self.cwd = event.get("path", self.cwd)
+            self.app.refresh_tabs()
+        elif kind == "new_tab":
+            self.app.new_tab(self.cwd)
+        elif kind == "close":
+            self.app.close_tab(self)
+        elif kind == "eof":
+            self.mark_dead()
+
+    def mark_dead(self):
+        if self.dead or self.closed:
+            return
+        self.dead = True
+        code = self.proc.poll()
+        self.write(f"Le moteur de cet onglet s'est arrêté (code {code}).", "#ff5555")
+        for line in list(self.stderr_tail)[-8:]:
+            self.write(line, "#ff5555")
+        self.write("Ferme l'onglet (Ctrl+W) et ouvres-en un nouveau (Ctrl+T).", "#ffaa00")
+
+    def write(self, text, color=None):
+        self.text.insert(tk.END, text + "\n")
+        if color:
+            tag = f"color_{color.replace('#', '')}"
+            self.text.tag_config(tag, foreground=color)
+            self.text.tag_add(tag, self.text.index("end-2l"), self.text.index("end-1l"))
+        self.text.see(tk.END)
+
+    def send(self, message):
+        try:
+            self.proc.stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def shutdown(self):
+        """Ferme le moteur : arrêt propre, puis forcé s'il ne répond pas."""
+        self.closed = True
+        self.send({"exit": True})
+        proc = self.proc
+
+        def force():
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        root.after(1500, force)
+
+    # ----- saisie -----
+    def submit(self, event=None):
+        line = self.entry.get().strip()
+        if not line:
+            return "break"
+        if not command_history or command_history[-1] != line:
+            command_history.append(line)
+            command_history[:] = command_history[-HISTORY_LIMIT:]
+            save_command_history()
+        self.history_index = len(command_history)
+        self.history_draft = ""
+        self.reset_completion()
+        self.entry.delete(0, tk.END)
+        if self.dead or not self.send({"cmd": line}):
+            self.write("Cet onglet est arrêté : ouvre-en un nouveau (Ctrl+T).", "#ffaa00")
+        return "break"
+
+    def reset_completion(self):
+        self.tab_matches, self.tab_index, self.tab_original = [], 0, ""
+
+    def complete(self, event=None):
+        """Complète les commandes et les chemins (relatifs au dossier de CET onglet)."""
+        entry = self.entry
+        current = entry.get()
+        cursor = entry.index(tk.INSERT)
+        before = current[:cursor]
+        token_start = max(before.rfind(" "), before.rfind("\t")) + 1
+        raw_token = before[token_start:]
+        quote = raw_token[:1] if raw_token[:1] in ("'", '"') else ""
+        token = raw_token[1:] if quote else raw_token
+
+        if not self.tab_matches or self.tab_original != current:
+            self.tab_original = current
+            self.tab_index = 0
+            if token_start == 0 and not any(sep in token for sep in (os.sep, "/", "\\")):
+                candidates = [name for name in COMMANDS if name.startswith(token.lower())]
+            else:
+                expanded = os.path.expanduser(token)
+                directory_part = os.path.dirname(expanded)
+                basename = os.path.basename(expanded)
+                search_dir = Path(self.cwd) / directory_part if directory_part else Path(self.cwd)
+                try:
+                    entries = list(search_dir.iterdir())
+                except (OSError, PermissionError):
+                    entries = []
+                candidates = []
+                for item in entries:
+                    if item.name.lower().startswith(basename.lower()):
+                        candidate = (str(Path(directory_part) / item.name)
+                                     if directory_part else item.name)
+                        if item.is_dir():
+                            candidate += os.sep
+                        candidates.append(candidate)
+                candidates.sort(key=str.lower)
+            self.tab_matches = candidates
+
+        if not self.tab_matches:
+            return "break"
+
+        candidate = self.tab_matches[self.tab_index % len(self.tab_matches)]
+        self.tab_index += 1
+        if quote:
+            candidate = quote + candidate
+            if not candidate.endswith(os.sep):
+                candidate += quote
+        elif " " in candidate:
+            candidate = '"' + candidate + ('"' if not candidate.endswith(os.sep) else '')
+        entry.delete(0, tk.END)
+        entry.insert(0, current[:token_start] + candidate + current[cursor:])
+        entry.icursor(token_start + len(candidate))
+        return "break"
+
+    def history_up(self, event=None):
+        if not command_history:
+            return "break"
+        if self.history_index == len(command_history):
+            self.history_draft = self.entry.get()
+        if self.history_index > 0:
+            self.history_index -= 1
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, command_history[self.history_index])
+        self.entry.icursor(tk.END)
+        self.reset_completion()
+        return "break"
+
+    def history_down(self, event=None):
+        if self.history_index < len(command_history):
+            self.history_index += 1
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, command_history[self.history_index]
+                          if self.history_index < len(command_history) else self.history_draft)
+        self.entry.icursor(tk.END)
+        self.reset_completion()
+        return "break"
+
+
+class TerminalApp:
+    BAR_BG, TAB_BG, TAB_ACTIVE = "#0d0d12", "#15151c", "#262633"
+
+    def __init__(self):
+        global root, background_label
+        self.tabs = []
+        self.active = None
+        self.events = queue.Queue()
+
+        root = tk.Tk()
+        root.title(WINDOW_TITLE)
+        root.geometry("1000x650")
+        root.minsize(700, 450)
+        root.configure(bg=BG_COLOR)
+
+        background_label = tk.Label(root, bg=BG_COLOR)
+        background_label.place(x=0, y=0, relwidth=1, relheight=1)
+
+        top_bar = tk.Frame(root, bg="#111118", height=45)
+        top_bar.pack(fill="x")
+        top_bar.pack_propagate(False)
+        tk.Label(top_bar, text="  CLEM TERMINAL", bg="#111118", fg="#ffffff",
+                 font=("Consolas", 12, "bold")).pack(side="left", padx=10)
+        tk.Button(top_bar, text="Fond", command=choose_background, bg="#20202a", fg="white",
+                  activebackground="#30303a", activeforeground="white", relief="flat",
+                  padx=12).pack(side="right", padx=10)
+
+        self.tabbar = tk.Frame(root, bg=self.BAR_BG)
+        self.tabbar.pack(fill="x")
+        self.content = tk.Frame(root, bg=BG_COLOR)
+        self.content.pack(fill="both", expand=True)
+
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+        self.new_tab(os.getcwd())
+        root.after(30, self.poll)
+
+    # ----- événements des moteurs -----
+    def poll(self):
+        for _ in range(500):
+            try:
+                tab, event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if not tab.closed:
+                tab.handle(event)
+        for tab in list(self.tabs):          # moteur disparu sans fermer son flux
+            if not tab.dead and tab.proc.poll() is not None:
+                tab.exit_seen = tab.exit_seen or time.time()
+                if time.time() - tab.exit_seen > 1.0:
+                    tab.mark_dead()
+        root.after(30, self.poll)
+
+    # ----- gestion des onglets -----
+    def new_tab(self, start_cwd=None):
+        if not isinstance(start_cwd, str):
+            start_cwd = self.active.cwd if self.active else os.getcwd()
+        tab = TerminalTab(self, start_cwd)
+        self.tabs.append(tab)
+        self.select(tab)
+        return tab
+
+    def select(self, tab):
+        if self.active is not None and self.active is not tab:
+            self.active.frame.pack_forget()
+        self.active = tab
+        tab.unread = False
+        tab.frame.pack(fill="both", expand=True)
+        tab.entry.focus_set()
+        tab.text.see(tk.END)
+        self.refresh_tabs()
+
+    def goto(self, index):
+        if 0 <= index < len(self.tabs):
+            self.select(self.tabs[index])
+
+    def cycle(self, step):
+        if self.tabs:
+            self.select(self.tabs[(self.tabs.index(self.active) + step) % len(self.tabs)])
+
+    def close_tab(self, tab):
+        if tab is None or tab not in self.tabs:
+            return
+        index = self.tabs.index(tab)
+        self.tabs.remove(tab)
+        tab.shutdown()
+        tab.frame.destroy()
+        if not self.tabs:
+            root.destroy()
+            return
+        if tab is self.active:
+            self.active = None
+            self.select(self.tabs[min(index, len(self.tabs) - 1)])
+        else:
+            self.refresh_tabs()
+
+    def quit(self):
+        for tab in self.tabs:
+            tab.closed = True
+            try:
+                tab.proc.kill()
+            except OSError:
+                pass
+        root.destroy()
+
+    def active_write(self, text, color=None):
+        if self.active is not None:
+            self.active.write(text, color)
+
+    # ----- barre d'onglets -----
+    def refresh_tabs(self):
+        for child in self.tabbar.winfo_children():
+            child.destroy()
+        for i, tab in enumerate(self.tabs):
+            is_active = tab is self.active
+            bg = self.TAB_ACTIVE if is_active else self.TAB_BG
+            box = tk.Frame(self.tabbar, bg=bg)
+            box.pack(side="left", padx=(6 if i == 0 else 2, 0), pady=(6, 0))
+            name = Path(tab.cwd).name or tab.cwd
+            label = tk.Label(box, text=f" {i + 1}  {name}{'  •' if tab.unread else ''} ",
+                             bg=bg, fg="#ffffff" if is_active else "#9a9aa8",
+                             font=("Consolas", 10), cursor="hand2")
+            label.pack(side="left", pady=(4, 4))
+            close = tk.Label(box, text="✕ ", bg=bg, fg="#9a9aa8", font=("Consolas", 10),
+                             cursor="hand2")
+            close.pack(side="left")
+            for widget in (box, label):
+                widget.bind("<Button-1>", lambda ev, t=tab: self.select(t))
+                widget.bind("<Button-2>", lambda ev, t=tab: self.close_tab(t))
+            close.bind("<Button-1>", lambda ev, t=tab: self.close_tab(t))
+            close.bind("<Enter>", lambda ev, w=close: w.config(fg=PROMPT_COLOR))
+            close.bind("<Leave>", lambda ev, w=close: w.config(fg="#9a9aa8"))
+            if is_active:
+                tk.Frame(box, bg=PROMPT_COLOR, height=2).place(relx=0, rely=1.0,
+                                                               relwidth=1, anchor="sw")
+        plus = tk.Label(self.tabbar, text=" + ", bg=self.BAR_BG, fg="#ffffff",
+                        font=("Consolas", 12, "bold"), cursor="hand2")
+        plus.pack(side="left", padx=(6, 0), pady=(6, 0))
+        plus.bind("<Button-1>", lambda ev: self.new_tab())
+        if self.active is not None:
+            root.title(f"{WINDOW_TITLE} — {self.active.cwd}")
+
 
 def choose_background():
     global background_image
@@ -2270,132 +4111,22 @@ def choose_background():
         terminal_print("Erreur : image non compatible.", "#ff5555")
 
 
-# ============================================================
-# FENÊTRE PRINCIPALE
-# ============================================================
-
-root = tk.Tk()
-root.title(WINDOW_TITLE)
-root.geometry("1000x650")
-root.minsize(700, 450)
-root.configure(bg=BG_COLOR)
-
-
-# ============================================================
-# IMAGE DE FOND
-# ============================================================
-
 background_image = None
-
-background_label = tk.Label(root, bg=BG_COLOR)
-background_label.place(x=0, y=0, relwidth=1, relheight=1)
+background_label = None
 
 
-# ============================================================
-# BARRE DU HAUT
-# ============================================================
-
-top_bar = tk.Frame(root, bg="#111118", height=45)
-top_bar.pack(fill="x")
-top_bar.pack_propagate(False)
-
-title = tk.Label(
-    top_bar,
-    text="  CLEM TERMINAL",
-    bg="#111118",
-    fg="#ffffff",
-    font=("Consolas", 12, "bold")
-)
-title.pack(side="left", padx=10)
-
-background_button = tk.Button(
-    top_bar,
-    text="Fond",
-    command=choose_background,
-    bg="#20202a",
-    fg="white",
-    activebackground="#30303a",
-    activeforeground="white",
-    relief="flat",
-    padx=12
-)
-background_button.pack(side="right", padx=10)
+def manager_main():
+    global _manager_sink
+    app = TerminalApp()
+    _manager_sink = app.active_write
+    root.mainloop()
 
 
 # ============================================================
-# ZONE TERMINAL
+# LANCEMENT
 # ============================================================
 
-terminal_frame = tk.Frame(root, bg=BG_COLOR)
-terminal_frame.pack(fill="both", expand=True, padx=15, pady=(15, 5))
-
-terminal = tk.Text(
-    terminal_frame,
-    bg=BG_COLOR,
-    fg=TEXT_COLOR,
-    insertbackground=TEXT_COLOR,
-    font=FONT,
-    relief="flat",
-    borderwidth=0,
-    wrap="word"
-)
-terminal.pack(fill="both", expand=True)
-
-
-# ============================================================
-# ZONE DE SAISIE
-# ============================================================
-
-input_frame = tk.Frame(root, bg="#111118")
-input_frame.pack(fill="x", padx=15, pady=15)
-
-prompt = tk.Label(
-    input_frame,
-    text=">",
-    bg="#111118",
-    fg=PROMPT_COLOR,
-    font=("Consolas", 12, "bold")
-)
-prompt.pack(side="left", padx=(10, 5))
-
-command_entry = tk.Entry(
-    input_frame,
-    bg=INPUT_COLOR,
-    fg=TEXT_COLOR,
-    insertbackground=TEXT_COLOR,
-    font=FONT,
-    relief="flat"
-)
-command_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 10))
-
-command_entry.bind("<Return>", execute_command)
-command_entry.bind("<Tab>", complete_command)
-command_entry.bind("<Up>", history_up)
-command_entry.bind("<Down>", history_down)
-command_entry.bind(
-    "<KeyRelease>",
-    lambda event: reset_completion() if event.keysym not in ("Tab", "Up", "Down") else None
-)
-
-
-# ============================================================
-# MESSAGE DE DÉMARRAGE
-# ============================================================
-
-terminal_print("========================================", "#00ff88")
-terminal_print("          CLEM TERMINAL", "#00ff88")
-terminal_print("========================================", "#00ff88")
-terminal_print("")
-terminal_print("Tape 'help' pour voir les commandes.", "#aaaaaa")
-terminal_print("")
-terminal_print(f"Dossier actuel : {os.getcwd()}", PROMPT_COLOR)
-terminal_print("")
-
-
-# ============================================================
-# FOCUS + LANCEMENT
-# ============================================================
-
-command_entry.focus_set()
-
-root.mainloop()
+if WORKER_MODE:
+    worker_main()
+else:
+    manager_main()

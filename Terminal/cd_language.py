@@ -13,8 +13,11 @@ class CDError(Exception):
     pass
 
 class CDInterpreter:
-    def __init__(self, command_runner, output, max_steps=10000):
+    def __init__(self, command_runner, output, max_steps=10000, is_command=None):
         self.command_runner = command_runner
+        # is_command(nom) -> True si c'est une commande du terminal : permet
+        # d'écrire  variable = commande args  et de récupérer son résultat.
+        self.is_command = is_command or (lambda name: False)
         self.output = output
         self.max_steps = max_steps
         self.steps = 0
@@ -223,7 +226,17 @@ class CDInterpreter:
             # Affectation (en respectant ==)
             assign = re.match(r'^([A-Za-z_]\w*(?:\[[^]]+\])?)\s*=\s*(?!=)(.+)$', raw)
             if assign:
-                target, value = assign.groups(); result = self.expr(value, env)
+                target, value = assign.groups()
+                try:
+                    result = self.expr(value, env)
+                except CDError:
+                    # Pas une expression : si ça commence par une commande du
+                    # terminal, on l'exécute et on stocke ce qu'elle renvoie.
+                    words = value.split()
+                    if words and self.is_command(words[0]):
+                        result = self.command_runner(value.strip(), env, self)
+                    else:
+                        raise
                 if '[' in target:
                     name, index = target.split('[',1); env[name][self.expr(index[:-1],env)] = result
                 else: env[target] = result
@@ -284,7 +297,7 @@ class CDEditor:
     def highlight(self,event=None):
         content=self.text.get('1.0','end-1c')
         for tag in ('comment','keyword','string','command','number'): self.text.tag_remove(tag,'1.0','end')
-        patterns={'comment':r'#[^\n]*','string':r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'','keyword':r'\b(?:if|else|repeat|while|return|true|false|and|or|not)\b','number':r'\b\d+(?:\.\d+)?\b','command':r'\b(?:cresce|gen_image|gen_video|save_img|delflow|cinit|copen|tik|print)\b'}
+        patterns={'comment':r'#[^\n]*','string':r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'','keyword':r'\b(?:if|else|repeat|while|return|true|false|and|or|not)\b','number':r'\b\d+(?:\.\d+)?\b','command':r'\b(?:cresce|cproject|gen_image|gen_video|save_video|save|delflow|cinit|copen|tik|pick|print)\b'}
         for tag,pattern in patterns.items():
             for m in re.finditer(pattern,content):
                 start=f'1.0+{m.start()}c'; end=f'1.0+{m.end()}c'; self.text.tag_add(tag,start,end)
